@@ -1,0 +1,18 @@
+{
+  "_comment": "$20预算保守配置 — 单笔$1, 日限3笔, EV>=6才触发",
+  "enabled": true,
+  "scan_interval_min": 5,
+  "min_ev_score": 6,
+  "min_volume": 50000,
+  "max_amount_per_trade": 1.0,
+  "max_daily_trades": 3,
+  "cooldown_minutes": 60,
+  "dry_run": true,
+  "urgency_filter": [1, 2],
+  "require_dispute_market": false,
+  "blacklist": [],
+  "telegram": {
+    "bot_token": "",
+    "chat_id": ""
+  }
+}

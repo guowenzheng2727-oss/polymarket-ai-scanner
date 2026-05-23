@@ -1,0 +1,32 @@
+# 私钥 — 绝对不要提交！
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Output
+output/*.json
+output/*.csv
+*.log
+*_history.json
+*_status.json
+
+# Streamlit
+.streamlit/
+
+# Debug / temp files
+_*.*
+debug_*.py
+test_*.py
+
+# Vercel
+.vercel/
+
+.vercel
