@@ -24,7 +24,7 @@ from scanner import (
     fetch_markets, parse_prices, parse_end_time,
     time_urgency, ev_signal, extract_tags, calc_volume_rank,
 )
-from ai_analyzer import analyze_market, quick_scan
+from ai_analyzer import analyze_market, quick_scan, gather_context
 
 
 # ============================================================
@@ -463,6 +463,14 @@ if mode == "beginner":
                     with ai_col2:
                         st.markdown("<br>", unsafe_allow_html=True)  # 对齐
                         if st.button("🔍 开始 AI 分析", type="primary", use_container_width=True):
+                            with st.spinner("🔎 正在搜索最新信息..."):
+                                search_ctx = gather_context(
+                                    question=row["question"],
+                                    tags=row["tags"],
+                                    ev_score=int(row["ev_score"]),
+                                    yes_price=row["yes"],
+                                    volume=row["volume"],
+                                )
                             with st.spinner("🤔 AI 正在分析市场..."):
                                 result = analyze_market(
                                     question=row["question"],
@@ -474,14 +482,32 @@ if mode == "beginner":
                                     ev_summary=row["ev_summary"],
                                     urgency_label=row["urgency_label"],
                                     tags=row["tags"],
+                                    search_context=search_ctx,
                                 )
                                 st.session_state.ai_result = result
                                 st.session_state.ai_market = row["question"]
+                                st.session_state.ai_search_info = {
+                                    "market_type": search_ctx["market_type"],
+                                    "search_depth": search_ctx["search_depth"],
+                                    "skipped": search_ctx["skipped"],
+                                    "skip_reason": search_ctx.get("skip_reason", ""),
+                                }
 
                     # 显示分析结果
                     if st.session_state.get("ai_result") and st.session_state.get("ai_market") == row["question"]:
                         st.markdown("---")
                         st.markdown(f"### 📊 AI 分析结果: {row['question'][:60]}")
+
+                        # 搜索状态标签
+                        search_info = st.session_state.get("ai_search_info", {})
+                        if search_info:
+                            depth = search_info.get("search_depth", 0)
+                            mtype = search_info.get("market_type", "")
+                            if search_info.get("skipped"):
+                                st.caption(f"🔍 搜索: 跳过（{search_info.get('skip_reason', '')}）| 市场类型: {mtype} | 纯 LLM 分析")
+                            else:
+                                st.caption(f"🔍 搜索深度: {'⭐' * depth} | 市场类型: {mtype} | RAG 增强分析")
+
                         st.info(st.session_state.ai_result)
 
                         # 市场数据摘要
@@ -756,6 +782,14 @@ else:
                 row = ai_candidates[ai_candidates["question"] == ai_sel].iloc[0]
 
                 if st.button("🔍 开始 AI 分析", type="primary", key="pro_ai_btn"):
+                    with st.spinner("🔎 正在搜索最新信息..."):
+                        search_ctx = gather_context(
+                            question=row["question"],
+                            tags=row["tags"],
+                            ev_score=int(row["ev_score"]),
+                            yes_price=row["yes"],
+                            volume=row["volume"],
+                        )
                     with st.spinner("🤔 AI 分析中..."):
                         result = analyze_market(
                             question=row["question"],
@@ -767,13 +801,31 @@ else:
                             ev_summary=row["ev_summary"],
                             urgency_label=row["urgency_label"],
                             tags=row["tags"],
+                            search_context=search_ctx,
                         )
                         st.session_state.ai_result_pro = result
                         st.session_state.ai_market_pro = row["question"]
+                        st.session_state.ai_search_info_pro = {
+                            "market_type": search_ctx["market_type"],
+                            "search_depth": search_ctx["search_depth"],
+                            "skipped": search_ctx["skipped"],
+                            "skip_reason": search_ctx.get("skip_reason", ""),
+                        }
 
                 if st.session_state.get("ai_result_pro") and st.session_state.get("ai_market_pro") == row["question"]:
                     st.markdown("---")
                     st.markdown("### 📊 AI 分析结果")
+
+                    # 搜索状态标签
+                    search_info = st.session_state.get("ai_search_info_pro", {})
+                    if search_info:
+                        depth = search_info.get("search_depth", 0)
+                        mtype = search_info.get("market_type", "")
+                        if search_info.get("skipped"):
+                            st.caption(f"🔍 搜索: 跳过（{search_info.get('skip_reason', '')}）| 市场类型: {mtype} | 纯 LLM 分析")
+                        else:
+                            st.caption(f"🔍 搜索深度: {'⭐' * depth} | 市场类型: {mtype} | RAG 增强分析")
+
                     st.info(st.session_state.ai_result_pro)
                     st.caption(
                         f"YES ${row['yes']:.4f} | NO ${row['no']:.4f} | "
