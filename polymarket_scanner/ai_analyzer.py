@@ -77,7 +77,11 @@ def classify_market(question: str, tags: str = "") -> str:
     Returns:
         "sports" | "politics" | "crypto_finance" | "entertainment" | "science_tech" | "general"
     """
-    text = (question + " " + (tags or "")).lower()
+    # 安全处理 tags：pandas NaN / None / 非字符串都兜底
+    tags_str = ""
+    if tags is not None and isinstance(tags, str):
+        tags_str = tags
+    text = (question + " " + tags_str).lower()
     scores = {}
     for category, patterns in _CATEGORY_PATTERNS:
         score = sum(1 for p in patterns if re.search(p, question, re.IGNORECASE))
