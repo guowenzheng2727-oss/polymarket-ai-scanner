@@ -374,7 +374,10 @@ if mode == "beginner":
                     search_context=search_ctx,
                 )
                 st.session_state.card_ai_results[pid] = {
-                    "result": result,
+                    "text": result.get("text", ""),
+                    "direction": result.get("direction", "hold"),
+                    "confidence": result.get("confidence", 0),
+                    "summary": result.get("summary", ""),
                     "search_info": {
                         "market_type": search_ctx["market_type"],
                         "search_depth": search_ctx["search_depth"],
@@ -433,7 +436,26 @@ if mode == "beginner":
                 with c4:
                     st.metric("成交量", f"${vol/1000:.0f}K")
                 with c5:
-                    if yes <= 0.40:
+                    # 优先用 AI 分析结果覆盖方向判断
+                    ai_direction = None
+                    ai_confidence = None
+                    ai_summary = None
+                    if rid in st.session_state.card_ai_results:
+                        ai_res = st.session_state.card_ai_results[rid]
+                        ai_direction = ai_res.get("direction")
+                        ai_confidence = ai_res.get("confidence", 0)
+                        ai_summary = ai_res.get("summary", "")
+
+                    if ai_direction == "buy_yes":
+                        st.success("🤖 买 YES")
+                        st.caption(f"AI {ai_confidence}星 | {ai_summary[:20]}" if ai_summary else "AI 建议买 YES")
+                    elif ai_direction == "buy_no":
+                        st.error("🤖 买 NO")
+                        st.caption(f"AI {ai_confidence}星 | {ai_summary[:20]}" if ai_summary else "AI 建议买 NO")
+                    elif ai_direction == "hold":
+                        st.warning("🤖 观望")
+                        st.caption(f"AI {ai_confidence}星 | {ai_summary[:20]}" if ai_summary else "AI 建议观望")
+                    elif yes <= 0.40:
                         st.success("✅ 买 YES")
                         st.caption("价格偏低，值博率高")
                     elif yes >= 0.60:
@@ -481,7 +503,16 @@ if mode == "beginner":
                             st.caption(f"🔍 搜索: 跳过（{search_info.get('skip_reason', '')}）| {mtype} | 纯 LLM 分析")
                         else:
                             st.caption(f"🔍 搜索: {'⭐' * depth} | {mtype} | RAG 增强分析")
-                        st.info(ai_data["result"])
+                        # 显示 AI 方向标签
+                        direction = ai_data.get("direction", "hold")
+                        conf = ai_data.get("confidence", 0)
+                        if direction == "buy_yes":
+                            st.success(f"🤖 AI 方向: 买 YES | 自信度 {conf}星")
+                        elif direction == "buy_no":
+                            st.error(f"🤖 AI 方向: 买 NO | 自信度 {conf}星")
+                        else:
+                            st.warning(f"🤖 AI 方向: 观望 | 自信度 {conf}星")
+                        st.info(ai_data.get("text", ""))
                         st.caption(
                             f"YES ${ai_data['yes']:.4f} | NO ${ai_data['no']:.4f} | "
                             f"成交量 ${ai_data['volume']:,.0f} | EV {ai_data['ev_score']}分 | "
@@ -596,7 +627,19 @@ if mode == "beginner":
                             else:
                                 st.caption(f"🔍 搜索深度: {'⭐' * depth} | 市场类型: {mtype} | RAG 增强分析")
 
-                        st.info(st.session_state.ai_result)
+                        # AI 方向标签
+                        ai_res = st.session_state.ai_result
+                        direction = ai_res.get("direction", "hold") if isinstance(ai_res, dict) else "hold"
+                        conf = ai_res.get("confidence", 0) if isinstance(ai_res, dict) else 0
+                        if direction == "buy_yes":
+                            st.success(f"🤖 AI 方向: 买 YES | 自信度 {conf}星")
+                        elif direction == "buy_no":
+                            st.error(f"🤖 AI 方向: 买 NO | 自信度 {conf}星")
+                        else:
+                            st.warning(f"🤖 AI 方向: 观望 | 自信度 {conf}星")
+
+                        text = ai_res.get("text", ai_res) if isinstance(ai_res, dict) else ai_res
+                        st.info(text)
 
                         # 市场数据摘要
                         st.caption(
@@ -806,7 +849,10 @@ else:
                         search_context=search_ctx,
                     )
                     st.session_state.pro_card_ai_results[pid] = {
-                        "result": result,
+                        "text": result.get("text", ""),
+                        "direction": result.get("direction", "hold"),
+                        "confidence": result.get("confidence", 0),
+                        "summary": result.get("summary", ""),
                         "search_info": {
                             "market_type": search_ctx["market_type"],
                             "search_depth": search_ctx["search_depth"],
@@ -859,7 +905,15 @@ else:
                                 st.caption(f"🔍 搜索: 跳过（{search_info.get('skip_reason', '')}）| {mtype} | 纯 LLM 分析")
                             else:
                                 st.caption(f"🔍 搜索: {'⭐' * depth} | {mtype} | RAG 增强分析")
-                            st.info(ai_data["result"])
+                            direction = ai_data.get("direction", "hold")
+                            conf = ai_data.get("confidence", 0)
+                            if direction == "buy_yes":
+                                st.success(f"🤖 AI 方向: 买 YES | 自信度 {conf}星")
+                            elif direction == "buy_no":
+                                st.error(f"🤖 AI 方向: 买 NO | 自信度 {conf}星")
+                            else:
+                                st.warning(f"🤖 AI 方向: 观望 | 自信度 {conf}星")
+                            st.info(ai_data.get("text", ""))
                             st.caption(
                                 f"YES ${ai_data['yes']:.4f} | EV {ai_data['ev_score']}分 | {ai_data['end_date']}"
                             )
@@ -987,7 +1041,19 @@ else:
                         else:
                             st.caption(f"🔍 搜索深度: {'⭐' * depth} | 市场类型: {mtype} | RAG 增强分析")
 
-                    st.info(st.session_state.ai_result_pro)
+                    # AI 方向标签
+                    ai_res = st.session_state.ai_result_pro
+                    direction = ai_res.get("direction", "hold") if isinstance(ai_res, dict) else "hold"
+                    conf = ai_res.get("confidence", 0) if isinstance(ai_res, dict) else 0
+                    if direction == "buy_yes":
+                        st.success(f"🤖 AI 方向: 买 YES | 自信度 {conf}星")
+                    elif direction == "buy_no":
+                        st.error(f"🤖 AI 方向: 买 NO | 自信度 {conf}星")
+                    else:
+                        st.warning(f"🤖 AI 方向: 观望 | 自信度 {conf}星")
+
+                    text = ai_res.get("text", ai_res) if isinstance(ai_res, dict) else ai_res
+                    st.info(text)
                     st.caption(
                         f"YES ${row['yes']:.4f} | NO ${row['no']:.4f} | "
                         f"成交量 ${row['volume']:,.0f} | EV {int(row['ev_score'])}分 | {row['end_date']}"

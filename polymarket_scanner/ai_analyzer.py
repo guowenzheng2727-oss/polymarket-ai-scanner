@@ -296,7 +296,7 @@ def analyze_market(
     urgency_label: str = "",
     tags: str = "",
     search_context: dict = None,
-) -> str:
+) -> dict:
     """调用 DeepSeek 对预测市场做深度分析（含可选的 RAG 搜索上下文）
 
     Args:
@@ -312,11 +312,16 @@ def analyze_market(
         search_context: gather_context() 的返回结果（可选）
 
     Returns:
-        AI 分析报告（中文）
+        dict: {
+            "text": str,       # 完整分析文本（用于展示）
+            "direction": str,  # "buy_yes" / "buy_no" / "hold"
+            "confidence": int, # 1-5
+            "summary": str,    # 一句话总结
+        }
     """
     client, error = get_deepseek_client()
     if error:
-        return error
+        return {"text": error, "direction": "hold", "confidence": 0, "summary": "API 未配置"}
 
     price_pct = yes_price * 100
 
@@ -326,18 +331,19 @@ def analyze_market(
     market_type = ctx.get("market_type", "")
     sources = ctx.get("sources", [])
 
-    if context_text:
-        # RAG 增强 prompt
-        prompt = f"""你是预测市场分析专家。请结合以下**实时搜索信息**分析这个 Polymarket 市场：
-
-【市场问题】{question}
+    base_info = f"""【市场问题】{question}
 【市场类型】{market_type}
 【YES价格】${yes_price:.4f}（市场定价概率 ~{price_pct:.0f}%）
 【NO价格】${no_price:.4f}
 【24h成交量】${volume:,.0f}
 【结束时间】{end_date}
 【量化EV评分】{ev_score}/12分（{ev_summary}）
-【时间紧迫度】{urgency_label}
+【时间紧迫度】{urgency_label}"""
+
+    if context_text:
+        prompt = f"""你是预测市场分析专家。请结合以下**实时搜索信息**分析这个 Polymarket 市场：
+
+{base_info}
 
 {context_text}
 
@@ -347,19 +353,17 @@ def analyze_market(
 3. **操作建议**：买YES / 买NO / 观望，简要理由
 4. **信息可信度**：搜索结果是否有足够信息支撑判断？（足/一般/不足）
 5. **一句话风险提示**
-6. **自信度**（1-5星，5=非常确定）"""
+6. **自信度**（1-5星，5=非常确定）
+
+最后，在最后一行用严格格式输出结构化结论（必须包含）：
+DIRECTION: buy_yes / buy_no / hold
+CONFIDENCE: 1-5
+SUMMARY: 一句话总结"""
     else:
-        # 无搜索上下文的纯 LLM 分析
         prompt = f"""你是预测市场分析专家。分析以下 Polymarket 市场：
 
-【问题】{question}
+{base_info}
 【标签】{tags if tags else "无"}
-【YES价格】${yes_price:.4f}（市场定价概率 ~{price_pct:.0f}%）
-【NO价格】${no_price:.4f}
-【24h成交量】${volume:,.0f}
-【结束时间】{end_date}
-【量化EV评分】{ev_score}/12分（{ev_summary}）
-【时间紧迫度】{urgency_label}
 
 请用简洁中文给出：
 1. **你的真实概率判断**：这件事实际发生的概率大概多少？为什么？
@@ -368,7 +372,12 @@ def analyze_market(
 4. **一句话风险提示**
 5. **自信度**（1-5星，5=非常确定）
 
-控制在200字以内，直接给结论。"""
+控制在200字以内，直接给结论。
+
+最后，在最后一行用严格格式输出结构化结论（必须包含）：
+DIRECTION: buy_yes / buy_no / hold
+CONFIDENCE: 1-5
+SUMMARY: 一句话总结"""
 
     try:
         response = client.chat.completions.create(
@@ -377,16 +386,46 @@ def analyze_market(
             temperature=0.3,
             max_tokens=600,
         )
-        result = response.choices[0].message.content
+        raw = response.choices[0].message.content
+
+        # 解析结构化结论
+        direction = "hold"
+        confidence = 3
+        summary = "AI 未给出明确结论"
+
+        for line in raw.split("\n"):
+            line = line.strip()
+            if line.startswith("DIRECTION:"):
+                d = line.replace("DIRECTION:", "").strip().lower()
+                if d in ("buy_yes", "buy_no", "hold"):
+                    direction = d
+            elif line.startswith("CONFIDENCE:"):
+                try:
+                    c = int(line.replace("CONFIDENCE:", "").strip())
+                    if 1 <= c <= 5:
+                        confidence = c
+                except ValueError:
+                    pass
+            elif line.startswith("SUMMARY:"):
+                summary = line.replace("SUMMARY:", "").strip()
+
+        # 去掉结构化行，展示文本更干净
+        text_lines = [l for l in raw.split("\n") if not l.strip().startswith(("DIRECTION:", "CONFIDENCE:", "SUMMARY:"))]
+        display_text = "\n".join(text_lines).strip()
 
         # 附上搜索来源
         if sources:
             src_list = "\n\n---\n📰 参考来源:\n" + "\n".join(s[:80] + "..." for s in sources[:3])
-            result += src_list
+            display_text += src_list
 
-        return result
+        return {
+            "text": display_text,
+            "direction": direction,
+            "confidence": confidence,
+            "summary": summary,
+        }
     except Exception as e:
-        return f"❌ AI 分析失败: {str(e)}"
+        return {"text": f"❌ AI 分析失败: {str(e)}", "direction": "hold", "confidence": 0, "summary": "分析失败"}
 
 
 # ============================================================
