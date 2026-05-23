@@ -341,6 +341,56 @@ if mode == "beginner":
     st.markdown("---")
     st.markdown("## 🎯 今日推荐交易")
 
+    # --- AI 分析状态管理 (推荐卡内联) ---
+    if "card_ai_pending" not in st.session_state:
+        st.session_state.card_ai_pending = None
+    if "card_ai_results" not in st.session_state:
+        st.session_state.card_ai_results = {}
+
+    # 处理待执行的 AI 分析（在渲染卡片前完成，结果内联展示）
+    if st.session_state.card_ai_pending:
+        pid = st.session_state.card_ai_pending
+        target = df[df["id"] == pid]
+        if not target.empty:
+            row = target.iloc[0]
+            with st.spinner(f"🤖 AI 正在分析: {row['question'][:40]}..."):
+                search_ctx = gather_context(
+                    question=row["question"],
+                    tags=row["tags"],
+                    ev_score=int(row["ev_score"]),
+                    yes_price=row["yes"],
+                    volume=row["volume"],
+                )
+                result = analyze_market(
+                    question=row["question"],
+                    yes_price=row["yes"],
+                    no_price=row["no"],
+                    volume=row["volume"],
+                    end_date=str(row["end_date"]),
+                    ev_score=int(row["ev_score"]),
+                    ev_summary=row["ev_summary"],
+                    urgency_label=row["urgency_label"],
+                    tags=row["tags"],
+                    search_context=search_ctx,
+                )
+                st.session_state.card_ai_results[pid] = {
+                    "result": result,
+                    "search_info": {
+                        "market_type": search_ctx["market_type"],
+                        "search_depth": search_ctx["search_depth"],
+                        "skipped": search_ctx["skipped"],
+                        "skip_reason": search_ctx.get("skip_reason", ""),
+                    },
+                    "question": row["question"],
+                    "yes": row["yes"],
+                    "no": row["no"],
+                    "volume": row["volume"],
+                    "ev_score": int(row["ev_score"]),
+                    "end_date": row["end_date"],
+                    "url": row["url"],
+                }
+        st.session_state.card_ai_pending = None
+
     recommend = df[
         (df["yes"].between(0.35, 0.65)) &
         (df["ev_score"] >= 5) &
@@ -350,6 +400,7 @@ if mode == "beginner":
 
     if not recommend.empty:
         for pos, (idx, row) in enumerate(recommend.iterrows()):
+            rid = row["id"]
             ev = int(row["ev_score"])
             yes = row["yes"]
             vol = row["volume"]
@@ -367,7 +418,7 @@ if mode == "beginner":
                 level = "值得关注"
 
             with st.container():
-                c1, c2, c3, c4, c5, c6 = st.columns([3, 1, 1, 1, 2, 1.5])
+                c1, c2, c3, c4, c5, c6, c7 = st.columns([2.5, 1, 0.8, 1, 1.5, 1.5, 0.8])
                 with c1:
                     st.markdown(f"### {star} #{pos+1}  {q[:70]}")
                     st.caption(
@@ -382,8 +433,6 @@ if mode == "beginner":
                 with c4:
                     st.metric("成交量", f"${vol/1000:.0f}K")
                 with c5:
-                    # 建议方向：YES 价格在博弈区间内，判断买哪边
-                    # Polymarket 页面：买 YES = 认为事件会发生；买 NO = 认为不会
                     if yes <= 0.40:
                         st.success("✅ 买 YES")
                         st.caption("价格偏低，值博率高")
@@ -400,7 +449,6 @@ if mode == "beginner":
                         st.info("⚖️ 两边均可")
                         st.caption("价格完全均衡")
                 with c6:
-                    # 优先显示直接链接，备用搜索链接
                     direct = row["direct_url"]
                     search = row["search_url"]
                     if direct:
@@ -408,9 +456,43 @@ if mode == "beginner":
                         st.caption("📎 直接链接（点击跳转）")
                     st.code(search, language=None)
                     st.caption("🔍 搜索链接（备用）")
+                with c7:
+                    # AI 分析按钮
+                    already = rid in st.session_state.card_ai_results
+                    if already:
+                        st.success("✅ 已分析")
+                    if st.button(
+                        "🤖 AI分析",
+                        key=f"card_ai_btn_{rid}",
+                        use_container_width=True,
+                        help="AI 深度分析：为什么推荐？怎样赚钱？",
+                    ):
+                        st.session_state.card_ai_pending = rid
+                        st.rerun()
+
+                # 展示 AI 分析结果
+                if rid in st.session_state.card_ai_results:
+                    ai_data = st.session_state.card_ai_results[rid]
+                    with st.expander("📊 AI 分析结果", expanded=True):
+                        search_info = ai_data.get("search_info", {})
+                        depth = search_info.get("search_depth", 0)
+                        mtype = search_info.get("market_type", "")
+                        if search_info.get("skipped"):
+                            st.caption(f"🔍 搜索: 跳过（{search_info.get('skip_reason', '')}）| {mtype} | 纯 LLM 分析")
+                        else:
+                            st.caption(f"🔍 搜索: {'⭐' * depth} | {mtype} | RAG 增强分析")
+                        st.info(ai_data["result"])
+                        st.caption(
+                            f"YES ${ai_data['yes']:.4f} | NO ${ai_data['no']:.4f} | "
+                            f"成交量 ${ai_data['volume']:,.0f} | EV {ai_data['ev_score']}分 | "
+                            f"{ai_data['end_date']}"
+                        )
+                        st.code(ai_data["url"], language=None)
+                        st.caption("⬆️ 复制链接 → 浏览器打开 → MetaMask 下单")
+
                 st.divider()
 
-        st.caption(f"🔍 {len(recommend)} 个博弈区间市场 | 💡 优先看前 3 个")
+        st.caption(f"🔍 {len(recommend)} 个博弈区间市场 | 💡 优先看前 3 个 | 🤖 点 AI分析 了解为什么推荐")
     else:
         st.info("当前无博弈区间推荐。可能市场比较平静，过几分钟再刷新看看。")
 
@@ -442,10 +524,16 @@ if mode == "beginner":
         ai_col1, ai_col2 = st.columns([3, 1])
 
         with ai_col1:
-            # 让用户选市场
-            ai_candidates = df[
-                (df["ev_score"] >= 3) & (df["volume"] > 5000)
-            ].nlargest(30, "ev_score")
+            # 让用户选市场 — 优先推荐市场 + 全局高EV
+            recommend_ids = set(recommend["id"].tolist()) if not recommend.empty else set()
+            # 推荐市场（优先）
+            rec_for_ai = recommend.copy() if not recommend.empty else pd.DataFrame()
+            # 全局高EV补充（排除已在推荐中的）
+            global_ev = df[
+                (df["ev_score"] >= 3) & (df["volume"] > 5000) &
+                (~df["id"].isin(recommend_ids))
+            ].nlargest(20, "ev_score")
+            ai_candidates = pd.concat([rec_for_ai, global_ev], ignore_index=True).drop_duplicates(subset="id")
 
             if not ai_candidates.empty:
                 ai_options = ai_candidates["question"].tolist()
@@ -453,7 +541,7 @@ if mode == "beginner":
                     "选择一个市场进行 AI 深度分析",
                     options=ai_options,
                     index=None,
-                    placeholder="点击选择...",
+                    placeholder="点击选择（推荐市场优先）...",
                     key="ai_select",
                 )
 
@@ -694,10 +782,48 @@ else:
             (df["urgency_level"].isin([1, 2, 3]))
         ].sort_values("ev_score", ascending=False).head(10)
 
+        # --- Pro 模式推荐卡 AI 分析状态 ---
+        if "pro_card_ai_pending" not in st.session_state:
+            st.session_state.pro_card_ai_pending = None
+        if "pro_card_ai_results" not in st.session_state:
+            st.session_state.pro_card_ai_results = {}
+
+        if st.session_state.pro_card_ai_pending:
+            pid = st.session_state.pro_card_ai_pending
+            target = df[df["id"] == pid]
+            if not target.empty:
+                row = target.iloc[0]
+                with st.spinner(f"🤖 AI 分析: {row['question'][:40]}..."):
+                    search_ctx = gather_context(
+                        question=row["question"], tags=row["tags"],
+                        ev_score=int(row["ev_score"]), yes_price=row["yes"], volume=row["volume"],
+                    )
+                    result = analyze_market(
+                        question=row["question"], yes_price=row["yes"], no_price=row["no"],
+                        volume=row["volume"], end_date=str(row["end_date"]),
+                        ev_score=int(row["ev_score"]), ev_summary=row["ev_summary"],
+                        urgency_label=row["urgency_label"], tags=row["tags"],
+                        search_context=search_ctx,
+                    )
+                    st.session_state.pro_card_ai_results[pid] = {
+                        "result": result,
+                        "search_info": {
+                            "market_type": search_ctx["market_type"],
+                            "search_depth": search_ctx["search_depth"],
+                            "skipped": search_ctx["skipped"],
+                            "skip_reason": search_ctx.get("skip_reason", ""),
+                        },
+                        "question": row["question"], "yes": row["yes"], "no": row["no"],
+                        "volume": row["volume"], "ev_score": int(row["ev_score"]),
+                        "end_date": row["end_date"], "url": row["url"],
+                    }
+            st.session_state.pro_card_ai_pending = None
+
         if not recommend.empty:
             for pos, (idx, row) in enumerate(recommend.iterrows()):
+                rid = row["id"]
                 with st.container():
-                    rc1, rc2, rc3, rc4, rc5 = st.columns([3, 1, 1, 1, 2])
+                    rc1, rc2, rc3, rc4, rc5, rc6 = st.columns([2.5, 1, 0.8, 0.8, 1.5, 0.8])
                     with rc1:
                         st.markdown(f"**{row['urgency_emoji']} {row['question'][:60]}**")
                         st.caption(f"✅ {row['ev_summary']}")
@@ -710,8 +836,36 @@ else:
                     with rc5:
                         st.code(row["url"], language=None)
                         st.caption("⬆️ 复制→浏览器下单")
+                    with rc6:
+                        if rid in st.session_state.pro_card_ai_results:
+                            st.success("✅ 已分析")
+                        if st.button(
+                            "🤖 AI分析",
+                            key=f"pro_card_ai_btn_{rid}",
+                            use_container_width=True,
+                            help="AI 深度分析：为什么推荐？怎样赚钱？",
+                        ):
+                            st.session_state.pro_card_ai_pending = rid
+                            st.rerun()
+
+                    # 展示 AI 结果
+                    if rid in st.session_state.pro_card_ai_results:
+                        ai_data = st.session_state.pro_card_ai_results[rid]
+                        with st.expander("📊 AI 分析结果", expanded=True):
+                            search_info = ai_data.get("search_info", {})
+                            depth = search_info.get("search_depth", 0)
+                            mtype = search_info.get("market_type", "")
+                            if search_info.get("skipped"):
+                                st.caption(f"🔍 搜索: 跳过（{search_info.get('skip_reason', '')}）| {mtype} | 纯 LLM 分析")
+                            else:
+                                st.caption(f"🔍 搜索: {'⭐' * depth} | {mtype} | RAG 增强分析")
+                            st.info(ai_data["result"])
+                            st.caption(
+                                f"YES ${ai_data['yes']:.4f} | EV {ai_data['ev_score']}分 | {ai_data['end_date']}"
+                            )
+                            st.code(ai_data["url"], language=None)
                     st.divider()
-            st.caption(f"🔍 {len(recommend)} 个推荐市场")
+            st.caption(f"🔍 {len(recommend)} 个推荐市场 | 🤖 点 AI分析 了解为什么推荐")
         else:
             st.info("当前无推荐，调整筛选条件再试。")
 
@@ -767,14 +921,21 @@ else:
         else:
             st.success("✅ DeepSeek API 已连接")
 
-        # 选市场分析
-        ai_candidates = df[(df["ev_score"] >= 3) & (df["volume"] > 5000)].nlargest(30, "ev_score")
+        # 选市场分析 — 推荐市场优先 + 全局高EV补充
+        recommend_ids = set(recommend["id"].tolist()) if not recommend.empty else set()
+        rec_for_ai = recommend.copy() if not recommend.empty else pd.DataFrame()
+        global_ev = df[
+            (df["ev_score"] >= 3) & (df["volume"] > 5000) &
+            (~df["id"].isin(recommend_ids))
+        ].nlargest(20, "ev_score")
+        ai_candidates = pd.concat([rec_for_ai, global_ev], ignore_index=True).drop_duplicates(subset="id")
 
         if not ai_candidates.empty:
             ai_options = ai_candidates["question"].tolist()
             ai_sel = st.selectbox(
                 "选择市场进行 AI 深度分析",
-                options=ai_options, index=None, placeholder="点击选择...",
+                options=ai_options, index=None,
+                placeholder="点击选择（推荐市场优先）...",
                 key="pro_ai_select",
             )
 
