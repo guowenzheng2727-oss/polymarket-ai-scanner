@@ -202,39 +202,254 @@ def build_search_queries(question: str, market_type: str) -> list:
 # ============================================================
 
 
-def search_news(query: str, max_results: int = 5, timeout: int = 8) -> list:
-    """通过 DuckDuckGo 搜索新闻，返回 [(title, snippet, url), ...]
+def _google_news_rss(query: str, max_results: int = 5, timeout: int = 10) -> list:
+    """[云端降级] Google News RSS 搜索 — 几乎不会被封。
+
+    RSS 端点不需要 JS、不触发 CAPTCHA，是最稳定的云端新闻源。
+    自动跟随 Google News 的重定向链获取真实文章 URL。
+
+    Returns:
+        [(title, snippet, url), ...] — 失败时返回空列表
+    """
+    import httpx
+    import xml.etree.ElementTree as ET
+    from bs4 import BeautifulSoup
+
+    try:
+        r = httpx.get(
+            "https://news.google.com/rss/search",
+            params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/rss+xml,application/xml,text/xml",
+            },
+            timeout=timeout,
+            follow_redirects=True,
+        )
+    except Exception:
+        return []
+
+    if r.status_code != 200:
+        return []
+
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError:
+        return []
+
+    items = root.findall(".//item")
+    results = []
+    for item in items[:max_results]:
+        title_el = item.find("title")
+        link_el = item.find("link")
+        desc_el = item.find("description")
+
+        title = title_el.text.strip() if title_el is not None and title_el.text else ""
+        gnews_url = link_el.text.strip() if link_el is not None and link_el.text else ""
+        desc = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
+
+        # 清洗 description 中的 HTML 标签
+        if desc:
+            desc = BeautifulSoup(desc, "html.parser").get_text()[:300]
+
+        # 跟随 Google News 重定向获取真实 URL
+        real_url = gnews_url
+        if "news.google.com/rss/articles/" in gnews_url:
+            try:
+                rr = httpx.get(gnews_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5, follow_redirects=False)
+                if rr.status_code in (301, 302):
+                    real_url = rr.headers.get("Location", gnews_url)
+                else:
+                    # Google News 有时候用 meta refresh
+                    from bs4 import BeautifulSoup as BS
+                    soup = BS(rr.text, "html.parser")
+                    meta = soup.find("meta", attrs={"http-equiv": "refresh"})
+                    if meta and meta.get("content"):
+                        content = meta["content"]
+                        if "url=" in content:
+                            real_url = content.split("url=", 1)[1].strip()
+            except Exception:
+                pass  # 保持 gnews_url
+
+        if title:
+            results.append((title, desc, real_url))
+
+    return results
+
+
+def _bing_news_rss(query: str, max_results: int = 5, timeout: int = 10) -> list:
+    """[备用] Bing News RSS 搜索 — 无需 API Key。
+
+    Returns:
+        [(title, snippet, url), ...] — 失败时返回空列表
+    """
+    import httpx
+    import xml.etree.ElementTree as ET
+
+    try:
+        r = httpx.get(
+            "https://www.bing.com/news/search",
+            params={"q": query, "format": "rss"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/rss+xml,application/xml,text/xml",
+            },
+            timeout=timeout,
+            follow_redirects=True,
+        )
+    except Exception:
+        return []
+
+    if r.status_code != 200:
+        return []
+
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError:
+        return []
+
+    items = root.findall(".//item")
+    results = []
+    for item in items[:max_results]:
+        title_el = item.find("title")
+        link_el = item.find("link")
+        desc_el = item.find("description")
+
+        title = title_el.text.strip() if title_el is not None and title_el.text else ""
+        url = link_el.text.strip() if link_el is not None and link_el.text else ""
+        desc = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
+
+        if title:
+            results.append((title, desc[:300], url))
+
+    return results
+
+
+def _ddg_html_search(query: str, max_results: int = 5, timeout: int = 10) -> list:
+    """[降级方案] 用 httpx 直接请求 DDG HTML 搜索页面，解析结果。
+
+    当 ddgs 库不可用时尝试，但 DDG 对云端 IP 可能返回挑战页（202）。
+
+    Returns:
+        [(title, snippet, url), ...] — 失败时返回空列表
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+
+    try:
+        r = httpx.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=timeout,
+            follow_redirects=True,
+        )
+    except Exception:
+        return []
+
+    if r.status_code != 200:
+        return []
+
+    soup = BeautifulSoup(r.text, "lxml")
+    results = []
+    for el in soup.select(".result")[:max_results]:
+        title_el = el.select_one(".result__title a")
+        snippet_el = el.select_one(".result__snippet")
+        if title_el:
+            title = title_el.get_text(strip=True)
+            url = title_el.get("href", "")
+            # 提取真实 URL（DDG 的 uddg 参数）
+            from urllib.parse import urlparse, parse_qs
+            if "uddg=" in url:
+                parsed = parse_qs(urlparse(url).query)
+                url = parsed.get("uddg", [url])[0]
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            results.append((title, snippet, url))
+
+    return results
+
+
+def search_news(query: str, max_results: int = 5, timeout: int = 10) -> list:
+    """多引擎搜索新闻，返回 [(title, snippet, url), ...]
+
+    五级降级策略（适配本地 + 云端 IP 封禁）：
+    1. Google News RSS（云端最稳定，优先 — 几乎永不被封）
+    2. ddgs 库 → news 搜索（本地最快最准）
+    3. ddgs 库 → text 搜索（news 不可用时降级）
+    4. httpx → DDG HTML 直搜（最后手段，取决于 IP）
+    5. Bing News RSS（终极备用）
 
     不用 API Key，免费。云端和本地均可用。
     """
+    import httpx
+
+    # —— 策略 1: Google News RSS（最稳定的云端方案，优先）——
+    rss_results = _google_news_rss(query, max_results=max_results, timeout=timeout)
+    if rss_results:
+        return rss_results
+
+    # —— 策略 2+3: ddgs 库 ——
     try:
         from ddgs import DDGS
     except ImportError:
         try:
             from duckduckgo_search import DDGS  # 旧版兼容
         except ImportError:
-            return [("", "⚠️ 需安装 ddgs 库: pip install ddgs", "")]
+            ddgs_available = False
+            pass
+    else:
+        ddgs_available = True
 
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.news(query, max_results=max_results, timelimit="w"))
-    except Exception as e:
-        # 可能被限流，降级到 text 搜索
+    ddgs_failed = False
+    if ddgs_available:
         try:
             with DDGS() as ddgs:
-                raw = list(ddgs.text(query, max_results=max_results))
-            results = [{"title": r["title"], "body": r["body"], "url": r.get("href", "")} for r in raw]
+                results = list(ddgs.news(query, max_results=max_results, timelimit="w"))
+            output = []
+            for r in results:
+                title = (r.get("title") or "").strip()
+                body = (r.get("body") or r.get("snippet") or "").strip()
+                url = (r.get("url") or r.get("link") or "").strip()
+                if title or body:
+                    output.append((title, body, url))
+            if output:
+                return output[:max_results]
         except Exception:
-            return [("", f"⚠️ 搜索暂时不可用: {str(e)[:80]}", "")]
+            # 可能被限流，降级到 text 搜索
+            try:
+                with DDGS() as ddgs:
+                    raw = list(ddgs.text(query, max_results=max_results))
+                output = []
+                for r in raw:
+                    title = (r.get("title") or "").strip()
+                    body = (r.get("body") or "").strip()
+                    url = (r.get("href") or "").strip()
+                    if title or body:
+                        output.append((title, body, url))
+                if output:
+                    return output[:max_results]
+            except Exception:
+                ddgs_failed = True
 
-    output = []
-    for r in results:
-        title = (r.get("title") or "").strip()
-        body = (r.get("body") or r.get("snippet") or "").strip()
-        url = (r.get("url") or r.get("link") or "").strip()
-        if title or body:
-            output.append((title, body, url))
-    return output[:max_results]
+    # —— 策略 4: Bing News RSS ——
+    bing_results = _bing_news_rss(query, max_results=max_results, timeout=timeout)
+    if bing_results:
+        return bing_results
+
+    # —— 策略 5: DDG HTML 直搜（最后手段）——
+    html_results = _ddg_html_search(query, max_results=max_results, timeout=timeout)
+    if html_results:
+        return html_results
+
+    # 全部失败
+    return [("", f"⚠️ 搜索暂时不可用（Google News RSS 无结果 + DDG {'失败' if ddgs_failed else '未安装'} + Bing RSS 无结果）", "")]
 
 
 # ============================================================

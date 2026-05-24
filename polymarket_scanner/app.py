@@ -474,6 +474,44 @@ if mode == "beginner":
         st.session_state.show_only_actionable = True  # 默认只显示有方向的
         st.rerun()
 
+    # --- 单个 AI 分析处理（新手模式也需要！） ---
+    if st.session_state.ai_pending:
+        pid = st.session_state.ai_pending
+        target = df[df["id"] == pid]
+        if not target.empty:
+            row = target.iloc[0]
+            with st.status(f"🤖 AI 分析: {row['question'][:40]}...", expanded=True) as status:
+                status.update(label="🔎 搜索最新信息...")
+                search_ctx = gather_context(
+                    question=row["question"], tags=row["tags"],
+                    ev_score=int(row["ev_score"]), yes_price=row["yes"], volume=row["volume"], ie_score=int(row["ie_score"]),
+                )
+                status.update(label="🧠 DeepSeek 推理...")
+                result = analyze_market(
+                    question=row["question"], yes_price=row["yes"], no_price=row["no"],
+                    volume=row["volume"], end_date=str(row["end_date"]),
+                    ev_score=int(row["ev_score"]), ev_summary=row["ev_summary"],
+                    urgency_label=row["urgency_label"], tags=row["tags"],
+                    search_context=search_ctx,
+                )
+                st.session_state.ai_results[pid] = {
+                    "text": result.get("text", ""),
+                    "direction": result.get("direction", "hold"),
+                    "confidence": result.get("confidence", 0),
+                    "summary": result.get("summary", ""),
+                    "search_info": {
+                        "market_type": search_ctx["market_type"],
+                        "search_depth": search_ctx["search_depth"],
+                        "skipped": search_ctx["skipped"],
+                        "skip_reason": search_ctx.get("skip_reason", ""),
+                    },
+                    "question": row["question"], "yes": row["yes"], "no": row["no"],
+                    "volume": row["volume"], "ev_score": int(row["ev_score"]),
+                    "end_date": row["end_date"], "url": row["url"],
+                }
+                status.update(label="✅ 分析完成", state="complete")
+        st.session_state.ai_pending = None
+
     # --- 推荐筛选：信息优势驱动 ---
     recommend = df[
         (df["ie_score"] >= 5) & (df["volume"] > 5000)
@@ -920,6 +958,128 @@ else:
                         st.warning(f"⚠️ 轻微负 EV ({ev:.4f})")
                     else:
                         st.error(f"❌ 显著负 EV ({ev:.4f})")
+
+                # ── 组合仓位计算器（对冲/套利） ──
+                st.markdown("---")
+                st.markdown("### 🧮 组合仓位计算器（双向持仓策略）")
+                st.caption("同时买 YES + NO，寻找『猜错不亏、猜中大赚』的仓位配比")
+
+                yes_price = float(row['yes'])
+                no_price = float(row['no'])
+                total_cost = yes_price + no_price
+
+                # 基础信息
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("YES 价格", f"${yes_price:.4f}")
+                with c2:
+                    st.metric("NO 价格", f"${no_price:.4f}")
+                with c3:
+                    st.metric("双向成本", f"${total_cost:.4f}", delta="套利!" if total_cost < 1.0 else None)
+
+                if total_cost < 1.0:
+                    st.success(f"🎯 **套利机会！** YES+NO=${total_cost:.4f} < $1.00，无风险套利空间 ${1-total_cost:.4f}（{(1-total_cost)/total_cost*100:.1f}%）")
+                elif total_cost > 1.02:
+                    st.warning(f"⚠️ 双向成本 ${total_cost:.4f} 偏高，需精准判断方向才能盈利")
+                else:
+                    st.info(f"💡 双向成本 ${total_cost:.4f}，接近平价")
+
+                # 用户输入预算
+                budget = st.number_input("💰 你的总预算 ($)", min_value=1.0, max_value=1000.0, value=10.0, step=1.0, key="hedge_budget")
+
+                # 计算最优配比
+                st.markdown("#### 📐 策略模拟")
+
+                # 策略1: 等金额对冲（最保守）
+                yes_amount_1 = budget / 2
+                no_amount_1 = budget / 2
+                yes_shares_1 = yes_amount_1 / yes_price if yes_price > 0 else 0
+                no_shares_1 = no_amount_1 / no_price if no_price > 0 else 0
+                profit_if_yes_1 = yes_shares_1 * (1 - yes_price) - no_amount_1  # YES赢时：YES盈利 - NO亏损
+                profit_if_no_1 = no_shares_1 * (1 - no_price) - yes_amount_1   # NO赢时：NO盈利 - YES亏损
+
+                # 策略2: 按价格反比配比（让两边潜在收益相等）
+                # 设 YES 投 x, NO 投 (budget-x)
+                # YES赢收益 = x/yes_price * (1-yes_price) - (budget-x) = x*(1-yes_price)/yes_price - budget + x
+                # NO赢收益 = (budget-x)/no_price * (1-no_price) - x = (budget-x)*(1-no_price)/no_price - x
+                # 令两边相等解 x
+                if yes_price > 0 and no_price > 0:
+                    # YES_win_profit = x * (1-yes_price)/yes_price - (budget-x)
+                    #                = x * (1/yes_price - 1) - budget + x
+                    #                = x / yes_price - budget
+                    # NO_win_profit = (budget-x) * (1-no_price)/no_price - x
+                    #               = (budget-x) / no_price - x
+                    # 令相等: x/yes_price - budget = (budget-x)/no_price - x
+                    # x/yes_price + x = budget + (budget-x)/no_price
+                    # x * (1/yes_price + 1) = budget + budget/no_price - x/no_price
+                    # x * (1/yes_price + 1 + 1/no_price) = budget * (1 + 1/no_price)
+                    denom = (1/yes_price) + 1 + (1/no_price)
+                    if denom > 0:
+                        x_opt = budget * (1 + 1/no_price) / denom
+                        x_opt = max(0, min(budget, x_opt))
+                    else:
+                        x_opt = budget / 2
+                else:
+                    x_opt = budget / 2
+
+                yes_amount_2 = x_opt
+                no_amount_2 = budget - x_opt
+                yes_shares_2 = yes_amount_2 / yes_price if yes_price > 0 else 0
+                no_shares_2 = no_amount_2 / no_price if no_price > 0 else 0
+                profit_if_yes_2 = yes_shares_2 * (1 - yes_price) - no_amount_2
+                profit_if_no_2 = no_shares_2 * (1 - no_price) - yes_amount_2
+
+                # 策略3: 你判断方向，加重注
+                your_direction = st.radio("你的判断方向（加重注）", ["均衡", "偏 YES", "偏 NO"], horizontal=True, key="hedge_dir")
+                if your_direction == "偏 YES":
+                    yes_amount_3 = budget * 0.7
+                    no_amount_3 = budget * 0.3
+                elif your_direction == "偏 NO":
+                    yes_amount_3 = budget * 0.3
+                    no_amount_3 = budget * 0.7
+                else:
+                    yes_amount_3 = budget * 0.5
+                    no_amount_3 = budget * 0.5
+
+                yes_shares_3 = yes_amount_3 / yes_price if yes_price > 0 else 0
+                no_shares_3 = no_amount_3 / no_price if no_price > 0 else 0
+                profit_if_yes_3 = yes_shares_3 * (1 - yes_price) - no_amount_3
+                profit_if_no_3 = no_shares_3 * (1 - no_price) - yes_amount_3
+
+                # 展示三种策略对比
+                st.markdown("| 策略 | YES 仓位 | NO 仓位 | 若YES赢 | 若NO赢 | 最差情况 |")
+                st.markdown("|------|----------|---------|---------|--------|----------|")
+
+                def fmt_profit(p):
+                    emoji = "🟢" if p > 0 else ("🔴" if p < 0 else "⚪")
+                    return f"{emoji} ${p:+.2f}"
+
+                st.markdown(f"| 等金额对冲 | ${yes_amount_1:.2f} | ${no_amount_1:.2f} | {fmt_profit(profit_if_yes_1)} | {fmt_profit(profit_if_no_1)} | {fmt_profit(min(profit_if_yes_1, profit_if_no_1))} |")
+                st.markdown(f"| 收益平衡 | ${yes_amount_2:.2f} | ${no_amount_2:.2f} | {fmt_profit(profit_if_yes_2)} | {fmt_profit(profit_if_no_2)} | {fmt_profit(min(profit_if_yes_2, profit_if_no_2))} |")
+                st.markdown(f"| {your_direction} | ${yes_amount_3:.2f} | ${no_amount_3:.2f} | {fmt_profit(profit_if_yes_3)} | {fmt_profit(profit_if_no_3)} | {fmt_profit(min(profit_if_yes_3, profit_if_no_3))} |")
+
+                # 推荐策略
+                best_strategy = None
+                best_min_profit = -9999
+                strategies = [
+                    ("等金额对冲", profit_if_yes_1, profit_if_no_1),
+                    ("收益平衡", profit_if_yes_2, profit_if_no_2),
+                    (your_direction, profit_if_yes_3, profit_if_no_3),
+                ]
+                for name, py, pn in strategies:
+                    min_p = min(py, pn)
+                    if min_p > best_min_profit:
+                        best_min_profit = min_p
+                        best_strategy = name
+
+                if best_min_profit > 0:
+                    st.success(f"🎯 **推荐策略：{best_strategy}** — 无论结果如何都盈利！最差盈利 ${best_min_profit:.2f}")
+                elif best_min_profit > -budget * 0.1:
+                    st.info(f"💡 **推荐策略：{best_strategy}** — 风险可控，最差亏损 ${abs(best_min_profit):.2f}（{abs(best_min_profit)/budget*100:.1f}%）")
+                else:
+                    st.warning(f"⚠️ **{best_strategy}** 相对最优，但双向成本高，建议精准判断单一方向")
+
+                st.caption("💡 提示：Polymarket 对赢家收取 2% 手续费，实际收益略低于上述计算")
         else:
             st.info("无符合筛选条件的市场。")
 
@@ -927,6 +1087,49 @@ else:
     # ========== Tab 3: 信号分析 ==========
     with tab3:
         st.subheader("📈 信号 & 推荐交易")
+
+        # --- 推荐筛选：信息优势驱动（Tab3 也需要定义 recommend） ---
+        recommend = df[
+            (df["ie_score"] >= 5) & (df["volume"] > 5000)
+        ].sort_values("ie_score", ascending=False).head(8)
+
+        # 单个 AI 分析（与新手模式共享 ai_pending 逻辑）
+        if st.session_state.ai_pending:
+            pid = st.session_state.ai_pending
+            target = df[df["id"] == pid]
+            if not target.empty:
+                row = target.iloc[0]
+                with st.status(f"🤖 AI 分析: {row['question'][:40]}...", expanded=True) as status:
+                    status.update(label="🔎 搜索最新信息...")
+                    search_ctx = gather_context(
+                        question=row["question"], tags=row["tags"],
+                        ev_score=int(row["ev_score"]), yes_price=row["yes"], volume=row["volume"], ie_score=int(row["ie_score"]),
+                    )
+                    status.update(label="🧠 DeepSeek 推理...")
+                    result = analyze_market(
+                        question=row["question"], yes_price=row["yes"], no_price=row["no"],
+                        volume=row["volume"], end_date=str(row["end_date"]),
+                        ev_score=int(row["ev_score"]), ev_summary=row["ev_summary"],
+                        urgency_label=row["urgency_label"], tags=row["tags"],
+                        search_context=search_ctx,
+                    )
+                    st.session_state.ai_results[pid] = {
+                        "text": result.get("text", ""),
+                        "direction": result.get("direction", "hold"),
+                        "confidence": result.get("confidence", 0),
+                        "summary": result.get("summary", ""),
+                        "search_info": {
+                            "market_type": search_ctx["market_type"],
+                            "search_depth": search_ctx["search_depth"],
+                            "skipped": search_ctx["skipped"],
+                            "skip_reason": search_ctx.get("skip_reason", ""),
+                        },
+                        "question": row["question"], "yes": row["yes"], "no": row["no"],
+                        "volume": row["volume"], "ev_score": int(row["ev_score"]),
+                        "end_date": row["end_date"], "url": row["url"],
+                    }
+                    status.update(label="✅ 分析完成", state="complete")
+            st.session_state.ai_pending = None
 
         # 批量 AI 分析
         if st.session_state.batch_ai_pending:
@@ -1026,10 +1229,7 @@ else:
         st.markdown("### 🎯 推荐交易（信息优势驱动）")
         st.caption("信息优势 ≥5 分 + 成交量 > $5K → AI 验证方向 → 找到可赚钱的信息差")
 
-        recommend = df[
-            (df["ie_score"] >= 5) & (df["volume"] > 5000)
-        ].sort_values("ie_score", ascending=False).head(8)
-
+        # recommend 已在 Tab3 开头定义，这里复用
         # "只看可操作"过滤
         actionable_count = 0
         if st.session_state.show_only_actionable and st.session_state.ai_results:
