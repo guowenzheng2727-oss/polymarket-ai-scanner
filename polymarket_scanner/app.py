@@ -23,8 +23,9 @@ STATUS_FILE  = BASE_DIR / "daemon_status.json"
 from scanner import (
     fetch_markets, parse_prices, parse_end_time,
     time_urgency, ev_signal, extract_tags, calc_volume_rank,
+    info_edge_score,
 )
-from ai_analyzer import analyze_market, quick_scan, gather_context
+from ai_analyzer import analyze_market, gather_context
 
 
 # ============================================================
@@ -48,13 +49,59 @@ st.markdown("""
 header {visibility: hidden;}
 .stDeployButton {display:none !important;}
 footer {visibility: hidden;}
-/* 紧凑卡片 */
+
+/* ===== 禁止 spinner 全屏灰白遮罩 ===== */
+.stSpinner > div {
+    border-color: #1f77b4 !important;
+}
+/* 用 status 替代 spinner 时不灰屏 */
+section[data-testid="stStatusBlock"] {
+    animation: none !important;
+}
+
+/* ===== 防止文字跨格/溢出 ===== */
+/* 代码块内强制换行 */
+.stCodeBlock code, .stCodeBlock pre, [data-testid="stCodeBlock"] code {
+    word-break: break-all !important;
+    white-space: pre-wrap !important;
+    overflow-wrap: break-word !important;
+}
+/* 链接文字溢出截断 */
+.stMarkdown a {
+    word-break: break-all;
+    overflow-wrap: break-word;
+}
+/* 所有文本列防溢出 */
+div[data-testid="column"] * {
+    overflow-wrap: break-word;
+}
+
+/* ===== 紧凑按钮 ===== */
+.compact-btn button {
+    font-size: 0.8rem !important;
+    padding: 0.25rem 0.5rem !important;
+    min-height: 2rem !important;
+    white-space: nowrap !important;
+}
+.compact-btn button p {
+    font-size: 0.8rem !important;
+}
+
+/* ===== 紧凑卡片 ===== */
 .compact-card {
     border: 1px solid #e0e0e0;
     border-radius: 8px;
     padding: 12px 16px;
     margin-bottom: 8px;
     background: #fafafa;
+}
+
+/* ===== 已分析标记：不换行 ===== */
+.analyzed-badge {
+    white-space: nowrap;
+    font-size: 0.8rem;
+    color: #0a8f3c;
+    font-weight: 600;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -103,6 +150,16 @@ def load_markets(limit: int = 300):
             direct_url = ""
         search_url = f"https://polymarket.com/search?_q={urllib.parse.quote(question)}"
 
+        tags_list = extract_tags(m)
+        hours_rem = (end_dt - now).total_seconds() / 3600 if end_dt else None
+        ie_signal = info_edge_score(
+            yes=prices["yes"],
+            volume=volume,
+            hours_remaining=hours_rem,
+            spread=prices["spread"],
+            tags=tags_list,
+        )
+
         enriched.append({
             "id":              m.get("id", ""),
             "question":        question,
@@ -120,12 +177,15 @@ def load_markets(limit: int = 300):
             "urgency_level":   urgency_level,
             "urgency_label":   urgency_label,
             "urgency_emoji":   urgency_emoji,
-            "tags":            extract_tags(m),
+            "tags":            tags_list,
             "heat_score":      calc_volume_rank(m),
             "ev_score":        signal["score"],
             "ev_flags":        ", ".join(signal["flags"]),
             "ev_summary":      signal["summary"],
-            "hours_remaining": (end_dt - now).total_seconds() / 3600 if end_dt else None,
+            "hours_remaining": hours_rem,
+            "ie_score":        ie_signal["score"],
+            "ie_flags":        ", ".join(ie_signal["flags"]),
+            "ie_rating":       ie_signal["rating"],
         })
 
     return pd.DataFrame(enriched)
@@ -341,161 +401,204 @@ if mode == "beginner":
     st.markdown("---")
     st.markdown("## 🎯 今日推荐交易")
 
-    # --- AI 分析状态管理 (推荐卡内联) ---
-    if "card_ai_pending" not in st.session_state:
-        st.session_state.card_ai_pending = None
-    if "card_ai_results" not in st.session_state:
-        st.session_state.card_ai_results = {}
+    # --- AI 分析状态管理（全模式共享） ---
+    if "ai_pending" not in st.session_state:
+        st.session_state.ai_pending = None
+    if "ai_results" not in st.session_state:
+        st.session_state.ai_results = {}
+    if "batch_ai_pending" not in st.session_state:
+        st.session_state.batch_ai_pending = False
+    if "show_only_actionable" not in st.session_state:
+        st.session_state.show_only_actionable = False
+    if "batch_scan_results" not in st.session_state:
+        st.session_state.batch_scan_results = {}
+    if "batch_scan_pending" not in st.session_state:
+        st.session_state.batch_scan_pending = False
+    if "auto_batch_enabled" not in st.session_state:
+        st.session_state.auto_batch_enabled = False
 
-    # 处理待执行的 AI 分析（在渲染卡片前完成，结果内联展示）
-    if st.session_state.card_ai_pending:
-        pid = st.session_state.card_ai_pending
-        target = df[df["id"] == pid]
-        if not target.empty:
+    # 批量 AI 分析：逐个分析推荐市场
+    if st.session_state.batch_ai_pending:
+        recommend_batch = df[
+            (df["ie_score"] >= 5) & (df["volume"] > 5000)
+        ].sort_values("ie_score", ascending=False).head(8)
+
+        batch_ids = recommend_batch["id"].tolist()
+        total_batch = len(batch_ids)
+        st.info(f"🚀 批量 AI 分析中...共 {total_batch} 个市场")
+
+        progress_bar = st.progress(0, text="准备...")
+        for i, rid in enumerate(batch_ids):
+            if rid in st.session_state.ai_results:
+                continue  # 跳过已分析的
+            target = df[df["id"] == rid]
+            if target.empty:
+                continue
             row = target.iloc[0]
-            with st.spinner(f"🤖 AI 正在分析: {row['question'][:40]}..."):
-                search_ctx = gather_context(
-                    question=row["question"],
-                    tags=row["tags"],
-                    ev_score=int(row["ev_score"]),
-                    yes_price=row["yes"],
-                    volume=row["volume"],
-                )
-                result = analyze_market(
-                    question=row["question"],
-                    yes_price=row["yes"],
-                    no_price=row["no"],
-                    volume=row["volume"],
-                    end_date=str(row["end_date"]),
-                    ev_score=int(row["ev_score"]),
-                    ev_summary=row["ev_summary"],
-                    urgency_label=row["urgency_label"],
-                    tags=row["tags"],
-                    search_context=search_ctx,
-                )
-                st.session_state.card_ai_results[pid] = {
-                    "text": result.get("text", ""),
-                    "direction": result.get("direction", "hold"),
-                    "confidence": result.get("confidence", 0),
-                    "summary": result.get("summary", ""),
-                    "search_info": {
-                        "market_type": search_ctx["market_type"],
-                        "search_depth": search_ctx["search_depth"],
-                        "skipped": search_ctx["skipped"],
-                        "skip_reason": search_ctx.get("skip_reason", ""),
-                    },
-                    "question": row["question"],
-                    "yes": row["yes"],
-                    "no": row["no"],
-                    "volume": row["volume"],
-                    "ev_score": int(row["ev_score"]),
-                    "end_date": row["end_date"],
-                    "url": row["url"],
-                }
-        st.session_state.card_ai_pending = None
+            progress_bar.progress(
+                (i + 1) / total_batch,
+                text=f"🤖 ({i+1}/{total_batch}) 分析: {row['question'][:40]}...",
+            )
+            search_ctx = gather_context(
+                question=row["question"], tags=row["tags"],
+                ev_score=int(row["ev_score"]), yes_price=row["yes"], volume=row["volume"], ie_score=int(row["ie_score"]),
+            )
+            result = analyze_market(
+                question=row["question"], yes_price=row["yes"], no_price=row["no"],
+                volume=row["volume"], end_date=str(row["end_date"]),
+                ev_score=int(row["ev_score"]), ev_summary=row["ev_summary"],
+                urgency_label=row["urgency_label"], tags=row["tags"],
+                search_context=search_ctx,
+            )
+            st.session_state.ai_results[rid] = {
+                "text": result.get("text", ""),
+                "direction": result.get("direction", "hold"),
+                "confidence": result.get("confidence", 0),
+                "summary": result.get("summary", ""),
+                "search_info": {
+                    "market_type": search_ctx["market_type"],
+                    "search_depth": search_ctx["search_depth"],
+                    "skipped": search_ctx["skipped"],
+                    "skip_reason": search_ctx.get("skip_reason", ""),
+                },
+                "question": row["question"], "yes": row["yes"], "no": row["no"],
+                "volume": row["volume"], "ev_score": int(row["ev_score"]),
+                "end_date": row["end_date"], "url": row["url"],
+            }
+            # 节流：避免 API 限流
+            import time as _time
+            _time.sleep(1.5)
 
+        progress_bar.progress(1.0, text="✅ 分析完成!")
+        st.session_state.batch_ai_pending = False
+        st.session_state.show_only_actionable = True  # 默认只显示有方向的
+        st.rerun()
+
+    # --- 推荐筛选：信息优势驱动 ---
     recommend = df[
-        (df["yes"].between(0.35, 0.65)) &
-        (df["ev_score"] >= 5) &
-        (df["volume"] > 5000) &
-        (df["urgency_level"].isin([1, 2, 3]))
-    ].sort_values("ev_score", ascending=False).head(8)
+        (df["ie_score"] >= 5) & (df["volume"] > 5000)
+    ].sort_values("ie_score", ascending=False).head(8)
+
+    # 如果有批量分析结果且开启了"只看可操作"，只保留 AI 给了方向的
+    actionable_count = 0
+    if st.session_state.show_only_actionable and st.session_state.ai_results:
+        actionable_ids = []
+        for _, row in recommend.iterrows():
+            rid = row["id"]
+            if rid in st.session_state.ai_results:
+                d = st.session_state.ai_results[rid].get("direction", "hold")
+                if d in ("buy_yes", "buy_no"):
+                    actionable_ids.append(rid)
+        if actionable_ids:
+            recommend = recommend[recommend["id"].isin(actionable_ids)]
+            actionable_count = len(actionable_ids)
+
+    # ── 控制栏 ──
+    ctl1, ctl2, ctl3 = st.columns([2, 1, 1])
+    with ctl1:
+        if st.button("🚀 批量 AI 分析推荐", type="primary", use_container_width=True,
+                     help="对推荐市场逐个运行 AI 深度分析（含联网搜索），找到真正有信息差的机会"):
+            st.session_state.batch_ai_pending = True
+            st.rerun()
+    with ctl2:
+        analyzed_count = len([
+            rid for _, row in recommend.iterrows()
+            if row["id"] in st.session_state.ai_results
+        ])
+        st.caption(f"已分析: {analyzed_count}/{len(recommend)}")
+    with ctl3:
+        if st.session_state.ai_results:
+            show_only = st.toggle(
+                "只看可操作", value=st.session_state.show_only_actionable,
+                help="开启后只显示 AI 明确给出买 YES/买 NO 的市场"
+            )
+            st.session_state.show_only_actionable = show_only
 
     if not recommend.empty:
         for pos, (idx, row) in enumerate(recommend.iterrows()):
             rid = row["id"]
+            ie = int(row["ie_score"])
             ev = int(row["ev_score"])
             yes = row["yes"]
             vol = row["volume"]
             q = row["question"]
             url = row["url"]
 
-            if ev >= 10:
-                star = "🔥"
-                level = "强烈推荐"
-            elif ev >= 7:
-                star = "⭐"
-                level = "优质信号"
+            # 信息优势评级
+            if ie >= 8:
+                ie_star = "🟢"
+                ie_label = "高信息优势"
+            elif ie >= 6:
+                ie_star = "🟡"
+                ie_label = "有信息机会"
             else:
-                star = "💡"
-                level = "值得关注"
+                ie_star = "🟠"
+                ie_label = "可关注"
+
+            # 已有 AI 分析结果的话，按方向决定是否灰掉
+            ai_direction = None
+            ai_confidence = 0
+            if rid in st.session_state.ai_results:
+                ai_res = st.session_state.ai_results[rid]
+                ai_direction = ai_res.get("direction")
+                ai_confidence = ai_res.get("confidence", 0)
+
+            # hold 且"只看可操作"开启时跳过（前面已经过滤，双重保险）
+            if st.session_state.show_only_actionable and ai_direction == "hold":
+                continue
 
             with st.container():
-                c1, c2, c3, c4, c5, c6, c7 = st.columns([2.5, 1, 0.8, 1, 1.5, 1.5, 0.8])
+                c1, c2, c3, c4, c5, c6, c7 = st.columns([2.2, 0.9, 0.8, 0.9, 1.3, 1.5, 1.3])
                 with c1:
-                    st.markdown(f"### {star} #{pos+1}  {q[:70]}")
+                    st.markdown(f"### {ie_star} #{pos+1}  {q[:65]}")
                     st.caption(
                         f"{row['urgency_emoji']} {row['end_date']} | "
-                        f"评分: {row['ev_summary']} | 标签: {row['tags']}"
+                        f"信息优势: {ie}分 | {row['ie_rating']}"
                     )
                 with c2:
                     st.metric("YES", f"${yes:.3f}")
                     st.caption(f"NO ${row['no']:.3f}")
                 with c3:
-                    st.metric("EV", f"{ev}分", delta=level)
+                    st.metric("信息差", f"{ie}分", delta=ie_label)
                 with c4:
                     st.metric("成交量", f"${vol/1000:.0f}K")
                 with c5:
-                    # 优先用 AI 分析结果覆盖方向判断
-                    ai_direction = None
-                    ai_confidence = None
-                    ai_summary = None
-                    if rid in st.session_state.card_ai_results:
-                        ai_res = st.session_state.card_ai_results[rid]
-                        ai_direction = ai_res.get("direction")
-                        ai_confidence = ai_res.get("confidence", 0)
-                        ai_summary = ai_res.get("summary", "")
-
+                    # 方向判断 — AI 结果优先
                     if ai_direction == "buy_yes":
-                        st.success("🤖 买 YES")
-                        st.caption(f"AI {ai_confidence}星 | {ai_summary[:20]}" if ai_summary else "AI 建议买 YES")
+                        st.success(f"🤖 买YES {ai_confidence}★")
                     elif ai_direction == "buy_no":
-                        st.error("🤖 买 NO")
-                        st.caption(f"AI {ai_confidence}星 | {ai_summary[:20]}" if ai_summary else "AI 建议买 NO")
+                        st.error(f"🤖 买NO {ai_confidence}★")
                     elif ai_direction == "hold":
-                        st.warning("🤖 观望")
-                        st.caption(f"AI {ai_confidence}星 | {ai_summary[:20]}" if ai_summary else "AI 建议观望")
-                    elif yes <= 0.40:
-                        st.success("✅ 买 YES")
-                        st.caption("价格偏低，值博率高")
-                    elif yes >= 0.60:
-                        st.error("✅ 买 NO")
-                        st.caption("YES 偏高，NO 更划算")
-                    elif yes < 0.50:
-                        st.success("👉 倾向买 YES")
-                        st.caption("YES 略偏低")
-                    elif yes > 0.50:
-                        st.error("👉 倾向买 NO")
-                        st.caption("NO 略划算")
+                        st.warning(f"🤖 观望 {ai_confidence}★")
+                    elif yes <= 0.45:
+                        st.success("👉 偏买YES")
+                    elif yes >= 0.55:
+                        st.error("👉 偏买NO")
                     else:
-                        st.info("⚖️ 两边均可")
-                        st.caption("价格完全均衡")
+                        st.info("⚖️ 均衡")
                 with c6:
                     direct = row["direct_url"]
-                    search = row["search_url"]
+                    search = row["search_url"][:55] + "…" if len(row["search_url"]) > 58 else row["search_url"]
                     if direct:
-                        st.markdown(f"[{row['question'][:30]}...]({direct})")
-                        st.caption("📎 直接链接（点击跳转）")
+                        st.markdown(f"[🔗 直达]({direct})")
                     st.code(search, language=None)
-                    st.caption("🔍 搜索链接（备用）")
                 with c7:
-                    # AI 分析按钮
-                    already = rid in st.session_state.card_ai_results
+                    already = rid in st.session_state.ai_results
                     if already:
-                        st.success("✅ 已分析")
+                        st.markdown('<span class="analyzed-badge">✅ 已分析</span>', unsafe_allow_html=True)
                     if st.button(
-                        "🤖 AI分析",
+                        "🤖分析" if not already else "🔄重分析",
                         key=f"card_ai_btn_{rid}",
                         use_container_width=True,
                         help="AI 深度分析：为什么推荐？怎样赚钱？",
                     ):
-                        st.session_state.card_ai_pending = rid
+                        st.session_state.ai_pending = rid
                         st.rerun()
 
                 # 展示 AI 分析结果
-                if rid in st.session_state.card_ai_results:
-                    ai_data = st.session_state.card_ai_results[rid]
-                    with st.expander("📊 AI 分析结果", expanded=True):
+                if rid in st.session_state.ai_results:
+                    ai_data = st.session_state.ai_results[rid]
+                    with st.expander("📊 AI 分析结果", expanded=(ai_direction != "hold")):
                         search_info = ai_data.get("search_info", {})
                         depth = search_info.get("search_depth", 0)
                         mtype = search_info.get("market_type", "")
@@ -503,19 +606,17 @@ if mode == "beginner":
                             st.caption(f"🔍 搜索: 跳过（{search_info.get('skip_reason', '')}）| {mtype} | 纯 LLM 分析")
                         else:
                             st.caption(f"🔍 搜索: {'⭐' * depth} | {mtype} | RAG 增强分析")
-                        # 显示 AI 方向标签
-                        direction = ai_data.get("direction", "hold")
-                        conf = ai_data.get("confidence", 0)
-                        if direction == "buy_yes":
-                            st.success(f"🤖 AI 方向: 买 YES | 自信度 {conf}星")
-                        elif direction == "buy_no":
-                            st.error(f"🤖 AI 方向: 买 NO | 自信度 {conf}星")
+                        # 方向标签
+                        if ai_direction == "buy_yes":
+                            st.success(f"🤖 AI 方向: 买 YES | 自信度 {ai_confidence}星")
+                        elif ai_direction == "buy_no":
+                            st.error(f"🤖 AI 方向: 买 NO | 自信度 {ai_confidence}星")
                         else:
-                            st.warning(f"🤖 AI 方向: 观望 | 自信度 {conf}星")
+                            st.warning(f"🤖 AI 方向: 观望 | 自信度 {ai_confidence}星")
                         st.info(ai_data.get("text", ""))
                         st.caption(
                             f"YES ${ai_data['yes']:.4f} | NO ${ai_data['no']:.4f} | "
-                            f"成交量 ${ai_data['volume']:,.0f} | EV {ai_data['ev_score']}分 | "
+                            f"成交量 ${ai_data['volume']:,.0f} | 信息差 {ie}分 | EV {ai_data['ev_score']}分 | "
                             f"{ai_data['end_date']}"
                         )
                         st.code(ai_data["url"], language=None)
@@ -523,9 +624,18 @@ if mode == "beginner":
 
                 st.divider()
 
-        st.caption(f"🔍 {len(recommend)} 个博弈区间市场 | 💡 优先看前 3 个 | 🤖 点 AI分析 了解为什么推荐")
+        # 底部统计
+        if actionable_count > 0:
+            st.success(f"🎯 {actionable_count} 个可操作市场 | 已有 AI 明确方向 | 去交易吧")
+        elif st.session_state.show_only_actionable:
+            st.warning("当前推荐市场 AI 尚未给出明确方向。关闭「只看可操作」查看全部，或手动逐个分析。")
+        else:
+            st.caption(f"🔍 {len(recommend)} 个推荐市场 | 信息优势 ≥ 5分 | 🚀 点批量分析找机会")
     else:
-        st.info("当前无博弈区间推荐。可能市场比较平静，过几分钟再刷新看看。")
+        if st.session_state.show_only_actionable:
+            st.info("当前无 AI 确认的可操作市场。关闭「只看可操作」查看候选，或过几分钟刷新数据。")
+        else:
+            st.info("当前无信息优势 ≥ 5 分的市场。可能市场比较平静，过几分钟再刷新看看。")
 
     # ── AI 深度分析 ──
     st.markdown("---")
@@ -582,20 +692,23 @@ if mode == "beginner":
                     with ai_col2:
                         st.markdown("<br>", unsafe_allow_html=True)  # 对齐
                         if st.button("🔍 开始 AI 分析", type="primary", use_container_width=True):
-                            with st.spinner("🔎 正在搜索最新信息..."):
+                            with st.status("🔎 联网搜索 + AI 分析中...", expanded=True) as status:
+                                status.update(label="🔎 Step 1/2: DuckDuckGo + Twitter + 专题数据搜索...")
                                 search_ctx = gather_context(
                                     question=row["question"],
                                     tags=row["tags"],
                                     ev_score=int(row["ev_score"]),
                                     yes_price=row["yes"],
                                     volume=row["volume"],
+                                    ie_score=int(row["ie_score"]),
                                 )
-                            with st.spinner("🤔 AI 正在分析市场..."):
+                                status.update(label="🧠 Step 2/2: DeepSeek 深度推理...")
                                 result = analyze_market(
                                     question=row["question"],
                                     yes_price=row["yes"],
                                     no_price=row["no"],
                                     volume=row["volume"],
+                                    ie_score=int(row["ie_score"]),
                                     end_date=str(row["end_date"]),
                                     ev_score=int(row["ev_score"]),
                                     ev_summary=row["ev_summary"],
@@ -611,6 +724,7 @@ if mode == "beginner":
                                     "skipped": search_ctx["skipped"],
                                     "skip_reason": search_ctx.get("skip_reason", ""),
                                 }
+                                status.update(label="✅ 分析完成", state="complete")
 
                     # 显示分析结果
                     if st.session_state.get("ai_result") and st.session_state.get("ai_market") == row["question"]:
@@ -812,35 +926,77 @@ else:
 
     # ========== Tab 3: 信号分析 ==========
     with tab3:
-        st.subheader("📈 EV 信号分析")
+        st.subheader("📈 信号 & 推荐交易")
 
-        # 傻瓜推荐
-        st.markdown("### 🎯 推荐交易（博弈区间 + 高EV）")
-        st.caption("YES $0.35-$0.65 + EV≥5 + 量>$5K + 即将到期")
+        # 批量 AI 分析
+        if st.session_state.batch_ai_pending:
+            recommend_batch = df[
+                (df["ie_score"] >= 5) & (df["volume"] > 5000)
+            ].sort_values("ie_score", ascending=False).head(8)
 
-        recommend = df[
-            (df["yes"].between(0.35, 0.65)) &
-            (df["ev_score"] >= 5) &
-            (df["volume"] > 5000) &
-            (df["urgency_level"].isin([1, 2, 3]))
-        ].sort_values("ev_score", ascending=False).head(10)
+            batch_ids = recommend_batch["id"].tolist()
+            total_batch = len(batch_ids)
+            st.info(f"🚀 批量 AI 分析中...共 {total_batch} 个市场")
 
-        # --- Pro 模式推荐卡 AI 分析状态 ---
-        if "pro_card_ai_pending" not in st.session_state:
-            st.session_state.pro_card_ai_pending = None
-        if "pro_card_ai_results" not in st.session_state:
-            st.session_state.pro_card_ai_results = {}
+            progress_bar = st.progress(0, text="准备...")
+            for i, rid in enumerate(batch_ids):
+                if rid in st.session_state.ai_results:
+                    continue
+                target = df[df["id"] == rid]
+                if target.empty:
+                    continue
+                row = target.iloc[0]
+                progress_bar.progress(
+                    (i + 1) / total_batch,
+                    text=f"🤖 ({i+1}/{total_batch}) 分析: {row['question'][:40]}...",
+                )
+                search_ctx = gather_context(
+                    question=row["question"], tags=row["tags"],
+                    ev_score=int(row["ev_score"]), yes_price=row["yes"], volume=row["volume"], ie_score=int(row["ie_score"]),
+                )
+                result = analyze_market(
+                    question=row["question"], yes_price=row["yes"], no_price=row["no"],
+                    volume=row["volume"], end_date=str(row["end_date"]),
+                    ev_score=int(row["ev_score"]), ev_summary=row["ev_summary"],
+                    urgency_label=row["urgency_label"], tags=row["tags"],
+                    search_context=search_ctx,
+                )
+                st.session_state.ai_results[rid] = {
+                    "text": result.get("text", ""),
+                    "direction": result.get("direction", "hold"),
+                    "confidence": result.get("confidence", 0),
+                    "summary": result.get("summary", ""),
+                    "search_info": {
+                        "market_type": search_ctx["market_type"],
+                        "search_depth": search_ctx["search_depth"],
+                        "skipped": search_ctx["skipped"],
+                        "skip_reason": search_ctx.get("skip_reason", ""),
+                    },
+                    "question": row["question"], "yes": row["yes"], "no": row["no"],
+                    "volume": row["volume"], "ev_score": int(row["ev_score"]),
+                    "end_date": row["end_date"], "url": row["url"],
+                }
+                import time as _time
+                _time.sleep(1.5)
 
-        if st.session_state.pro_card_ai_pending:
-            pid = st.session_state.pro_card_ai_pending
+            progress_bar.progress(1.0, text="✅ 分析完成!")
+            st.session_state.batch_ai_pending = False
+            st.session_state.show_only_actionable = True
+            st.rerun()
+
+        # 单个 AI 分析
+        if st.session_state.ai_pending:
+            pid = st.session_state.ai_pending
             target = df[df["id"] == pid]
             if not target.empty:
                 row = target.iloc[0]
-                with st.spinner(f"🤖 AI 分析: {row['question'][:40]}..."):
+                with st.status(f"🤖 AI 分析: {row['question'][:40]}...", expanded=True) as status:
+                    status.update(label="🔎 搜索最新信息...")
                     search_ctx = gather_context(
                         question=row["question"], tags=row["tags"],
-                        ev_score=int(row["ev_score"]), yes_price=row["yes"], volume=row["volume"],
+                        ev_score=int(row["ev_score"]), yes_price=row["yes"], volume=row["volume"], ie_score=int(row["ie_score"]),
                     )
+                    status.update(label="🧠 DeepSeek 推理...")
                     result = analyze_market(
                         question=row["question"], yes_price=row["yes"], no_price=row["no"],
                         volume=row["volume"], end_date=str(row["end_date"]),
@@ -848,7 +1004,7 @@ else:
                         urgency_label=row["urgency_label"], tags=row["tags"],
                         search_context=search_ctx,
                     )
-                    st.session_state.pro_card_ai_results[pid] = {
+                    st.session_state.ai_results[pid] = {
                         "text": result.get("text", ""),
                         "direction": result.get("direction", "hold"),
                         "confidence": result.get("confidence", 0),
@@ -863,41 +1019,134 @@ else:
                         "volume": row["volume"], "ev_score": int(row["ev_score"]),
                         "end_date": row["end_date"], "url": row["url"],
                     }
-            st.session_state.pro_card_ai_pending = None
+                    status.update(label="✅ 分析完成", state="complete")
+            st.session_state.ai_pending = None
+
+        # --- 推荐：信息优势驱动 ---
+        st.markdown("### 🎯 推荐交易（信息优势驱动）")
+        st.caption("信息优势 ≥5 分 + 成交量 > $5K → AI 验证方向 → 找到可赚钱的信息差")
+
+        recommend = df[
+            (df["ie_score"] >= 5) & (df["volume"] > 5000)
+        ].sort_values("ie_score", ascending=False).head(8)
+
+        # "只看可操作"过滤
+        actionable_count = 0
+        if st.session_state.show_only_actionable and st.session_state.ai_results:
+            actionable_ids = []
+            for _, row in recommend.iterrows():
+                rid = row["id"]
+                if rid in st.session_state.ai_results:
+                    d = st.session_state.ai_results[rid].get("direction", "hold")
+                    if d in ("buy_yes", "buy_no"):
+                        actionable_ids.append(rid)
+            if actionable_ids:
+                recommend = recommend[recommend["id"].isin(actionable_ids)]
+                actionable_count = len(actionable_ids)
+
+        # 控制栏
+        ctl1, ctl2, ctl3 = st.columns([2, 1, 1])
+        with ctl1:
+            if st.button("🚀 批量 AI 分析推荐", type="primary", use_container_width=True,
+                         key="pro_batch_ai_btn",
+                         help="对推荐市场逐个运行 AI 深度分析（含联网搜索），找到真正有信息差的机会"):
+                st.session_state.batch_ai_pending = True
+                st.rerun()
+        with ctl2:
+            analyzed_count = len([
+                rid for _, row in recommend.iterrows()
+                if row["id"] in st.session_state.ai_results
+            ])
+            st.caption(f"已分析: {analyzed_count}/{len(recommend)}")
+        with ctl3:
+            if st.session_state.ai_results:
+                show_only = st.toggle(
+                    "只看可操作", value=st.session_state.show_only_actionable,
+                    key="pro_show_actionable_toggle",
+                    help="开启后只显示 AI 明确给出买 YES/买 NO 的市场"
+                )
+                st.session_state.show_only_actionable = show_only
 
         if not recommend.empty:
             for pos, (idx, row) in enumerate(recommend.iterrows()):
                 rid = row["id"]
+                ie = int(row["ie_score"])
+                yes = row["yes"]
+
+                # 信息优势评级
+                if ie >= 8:
+                    ie_star = "🟢"
+                    ie_label = "高信息优势"
+                elif ie >= 6:
+                    ie_star = "🟡"
+                    ie_label = "有信息机会"
+                else:
+                    ie_star = "🟠"
+                    ie_label = "可关注"
+
+                # AI 方向
+                ai_direction = None
+                ai_confidence = 0
+                if rid in st.session_state.ai_results:
+                    ai_res = st.session_state.ai_results[rid]
+                    ai_direction = ai_res.get("direction")
+                    ai_confidence = ai_res.get("confidence", 0)
+
+                if st.session_state.show_only_actionable and ai_direction == "hold":
+                    continue
+
                 with st.container():
-                    rc1, rc2, rc3, rc4, rc5, rc6 = st.columns([2.5, 1, 0.8, 0.8, 1.5, 0.8])
+                    rc1, rc2, rc3, rc4, rc5, rc6, rc7 = st.columns([2.2, 0.9, 0.8, 0.9, 1.3, 1.5, 1.3])
                     with rc1:
-                        st.markdown(f"**{row['urgency_emoji']} {row['question'][:60]}**")
-                        st.caption(f"✅ {row['ev_summary']}")
+                        st.markdown(f"### {ie_star} #{pos+1}  {row['question'][:60]}")
+                        st.caption(
+                            f"{row['urgency_emoji']} {row['end_date']} | "
+                            f"信息优势: {ie}分 | {row['ie_rating']}"
+                        )
                     with rc2:
-                        st.metric("YES", f"{row['yes']:.3f}")
+                        st.metric("YES", f"${yes:.3f}")
+                        st.caption(f"NO ${row['no']:.3f}")
                     with rc3:
-                        st.metric("EV", f"{int(row['ev_score'])}分")
+                        st.metric("信息差", f"{ie}分", delta=ie_label)
                     with rc4:
-                        st.metric("量", f"${row['volume']/1000:.0f}K")
+                        st.metric("成交量", f"${row['volume']/1000:.0f}K")
+                        st.caption(f"EV {int(row['ev_score'])}分")
                     with rc5:
-                        st.code(row["url"], language=None)
-                        st.caption("⬆️ 复制→浏览器下单")
+                        if ai_direction == "buy_yes":
+                            st.success(f"🤖 买YES {ai_confidence}★")
+                        elif ai_direction == "buy_no":
+                            st.error(f"🤖 买NO {ai_confidence}★")
+                        elif ai_direction == "hold":
+                            st.warning(f"🤖 观望 {ai_confidence}★")
+                        elif yes <= 0.45:
+                            st.success("👉 偏买YES")
+                        elif yes >= 0.55:
+                            st.error("👉 偏买NO")
+                        else:
+                            st.info("⚖️ 均衡")
                     with rc6:
-                        if rid in st.session_state.pro_card_ai_results:
-                            st.success("✅ 已分析")
+                        direct = row["direct_url"]
+                        search = row["search_url"][:55] + "…" if len(row["search_url"]) > 58 else row["search_url"]
+                        if direct:
+                            st.markdown(f"[🔗 直达]({direct})")
+                        st.code(search, language=None)
+                    with rc7:
+                        already = rid in st.session_state.ai_results
+                        if already:
+                            st.markdown('<span class="analyzed-badge">✅ 已分析</span>', unsafe_allow_html=True)
                         if st.button(
-                            "🤖 AI分析",
-                            key=f"pro_card_ai_btn_{rid}",
+                            "🤖分析" if not already else "🔄重分析",
+                            key=f"pro_card_tab3_ai_btn_{rid}",
                             use_container_width=True,
                             help="AI 深度分析：为什么推荐？怎样赚钱？",
                         ):
-                            st.session_state.pro_card_ai_pending = rid
+                            st.session_state.ai_pending = rid
                             st.rerun()
 
                     # 展示 AI 结果
-                    if rid in st.session_state.pro_card_ai_results:
-                        ai_data = st.session_state.pro_card_ai_results[rid]
-                        with st.expander("📊 AI 分析结果", expanded=True):
+                    if rid in st.session_state.ai_results:
+                        ai_data = st.session_state.ai_results[rid]
+                        with st.expander("📊 AI 分析结果", expanded=(ai_direction != "hold")):
                             search_info = ai_data.get("search_info", {})
                             depth = search_info.get("search_depth", 0)
                             mtype = search_info.get("market_type", "")
@@ -919,9 +1168,18 @@ else:
                             )
                             st.code(ai_data["url"], language=None)
                     st.divider()
-            st.caption(f"🔍 {len(recommend)} 个推荐市场 | 🤖 点 AI分析 了解为什么推荐")
+
+            if actionable_count > 0:
+                st.success(f"🎯 {actionable_count} 个可操作市场 | 已有 AI 明确方向 | 去交易吧")
+            elif st.session_state.show_only_actionable:
+                st.warning("当前推荐市场 AI 尚未给出明确方向。关闭「只看可操作」查看全部，或手动逐个分析。")
+            else:
+                st.caption(f"🔍 {len(recommend)} 个推荐市场 | 信息优势 ≥ 5分 | 🚀 点批量分析找机会")
         else:
-            st.info("当前无推荐，调整筛选条件再试。")
+            if st.session_state.show_only_actionable:
+                st.info("当前无 AI 确认的可操作市场。关闭「只看可操作」查看候选，或过几分钟刷新数据。")
+            else:
+                st.info("当前无信息优势 ≥ 5 分的市场。调整筛选条件或过几分钟刷新。")
 
         st.markdown("---")
         signals_df = df[df["ev_score"] > 0].copy()
@@ -997,15 +1255,17 @@ else:
                 row = ai_candidates[ai_candidates["question"] == ai_sel].iloc[0]
 
                 if st.button("🔍 开始 AI 分析", type="primary", key="pro_ai_btn"):
-                    with st.spinner("🔎 正在搜索最新信息..."):
+                    with st.status("🔎 联网搜索 + AI 分析中...", expanded=True) as status:
+                        status.update(label="🔎 Step 1/2: 搜索最新信息...")
                         search_ctx = gather_context(
                             question=row["question"],
                             tags=row["tags"],
                             ev_score=int(row["ev_score"]),
                             yes_price=row["yes"],
                             volume=row["volume"],
+                            ie_score=int(row["ie_score"]),
                         )
-                    with st.spinner("🤔 AI 分析中..."):
+                        status.update(label="🧠 Step 2/2: DeepSeek 深度推理...")
                         result = analyze_market(
                             question=row["question"],
                             yes_price=row["yes"],
@@ -1026,6 +1286,7 @@ else:
                             "skipped": search_ctx["skipped"],
                             "skip_reason": search_ctx.get("skip_reason", ""),
                         }
+                        status.update(label="✅ 分析完成", state="complete")
 
                 if st.session_state.get("ai_result_pro") and st.session_state.get("ai_market_pro") == row["question"]:
                     st.markdown("---")
@@ -1061,24 +1322,130 @@ else:
                     st.markdown("#### 📋 去交易")
                     st.code(row["url"], language=None)
 
-            # 批量快速扫描
+            # ========== 批量联网深度扫描（analyze_market + RAG）==========
             st.markdown("---")
-            st.markdown("### ⚡ 批量快速扫描 (Top 5)")
-            if st.button("🚀 一键扫描 Top 5", key="pro_batch_scan"):
-                top5 = ai_candidates.head(5)
-                results = []
-                for _, r in top5.iterrows():
-                    with st.spinner(f"分析: {r['question'][:40]}..."):
-                        res = quick_scan(r["question"], r["yes"], r["end_date"])
-                        results.append({
-                            "market": r["question"][:50],
-                            "yes": f"${r['yes']:.4f}",
-                            "ev": int(r["ev_score"]),
-                            "ai": res,
-                        })
-                for i, r in enumerate(results):
-                    st.markdown(f"**{i+1}. {r['market']}** | YES {r['yes']} | EV {r['ev']}分")
-                    st.caption(r["ai"])
+            st.markdown("### 🌐 批量联网深度扫描 (Top 5 RAG)")
+            st.caption("与新手模式同款分析：DuckDuckGo 实时搜索 + DeepSeek 深度推理 → 结构化方向+自信度")
+
+            top5 = ai_candidates.head(5)
+            top5_unanalyzed = [
+                rid for rid in top5["id"].tolist()
+                if rid not in st.session_state.batch_scan_results
+            ]
+
+            # 自动批量：toggle 开启 + 有未分析市场 → 自动触发
+            auto_toggle = st.toggle(
+                "🔄 启动时自动批量分析",
+                value=st.session_state.auto_batch_enabled,
+                key="pro_auto_batch_toggle",
+                help="开启后每次数据刷新自动对 Top 5 执行联网深度分析（有 API 消耗）",
+            )
+            st.session_state.auto_batch_enabled = auto_toggle
+
+            if auto_toggle and top5_unanalyzed and not st.session_state.batch_scan_pending:
+                st.session_state.batch_scan_pending = True
+                st.rerun()
+
+            # 执行批量扫描
+            if st.session_state.batch_scan_pending:
+                total = len(top5)
+                st.info(f"🌐 联网深度扫描中...共 {total} 个市场（DuckDuckGo 搜索 + AI 分析）")
+                progress_bar = st.progress(0, text="准备...")
+                for i, (_, r) in enumerate(top5.iterrows()):
+                    rid = r["id"]
+                    if rid in st.session_state.batch_scan_results:
+                        continue
+                    progress_bar.progress(
+                        (i + 1) / total,
+                        text=f"🤖 ({i+1}/{total}) 分析: {r['question'][:40]}...",
+                    )
+                    search_ctx = gather_context(
+                        question=r["question"], tags=r["tags"],
+                        ev_score=int(r["ev_score"]), yes_price=r["yes"], volume=r["volume"], ie_score=int(r["ie_score"]),
+                    )
+                    result = analyze_market(
+                        question=r["question"], yes_price=r["yes"], no_price=r["no"],
+                        volume=r["volume"], end_date=str(r["end_date"]),
+                        ev_score=int(r["ev_score"]), ev_summary=r["ev_summary"],
+                        urgency_label=r["urgency_label"], tags=r["tags"],
+                        search_context=search_ctx,
+                    )
+                    st.session_state.batch_scan_results[rid] = {
+                        "text": result.get("text", ""),
+                        "direction": result.get("direction", "hold"),
+                        "confidence": result.get("confidence", 0),
+                        "summary": result.get("summary", ""),
+                        "search_info": {
+                            "market_type": search_ctx["market_type"],
+                            "search_depth": search_ctx["search_depth"],
+                            "skipped": search_ctx["skipped"],
+                            "skip_reason": search_ctx.get("skip_reason", ""),
+                        },
+                        "question": r["question"], "yes": r["yes"], "no": r["no"],
+                        "volume": r["volume"], "ev_score": int(r["ev_score"]),
+                        "end_date": r["end_date"], "url": r["url"],
+                    }
+                    import time as _time
+                    _time.sleep(1.5)
+                progress_bar.progress(1.0, text="✅ 深度分析完成!")
+                st.session_state.batch_scan_pending = False
+                st.rerun()
+
+            # 手动触发按钮
+            analyzed_in_batch = len(st.session_state.batch_scan_results)
+            b1, b2 = st.columns([2, 1])
+            with b1:
+                if st.button(
+                    "🚀 联网深度扫描 Top 5",
+                    type="primary",
+                    use_container_width=True,
+                    key="pro_deep_batch_btn",
+                    disabled=bool(st.session_state.batch_scan_pending),
+                    help="对 Top 5 市场执行 DuckDuckGo 实时搜索 + DeepSeek 深度分析",
+                ):
+                    st.session_state.batch_scan_pending = True
+                    st.rerun()
+            with b2:
+                st.caption(f"已分析: {analyzed_in_batch}/{total_top5 if (total_top5 := len(top5)) else 0}")
+
+            # 展示结果
+            if st.session_state.batch_scan_results:
+                st.markdown("---")
+                st.markdown("### 📊 批量扫描结果")
+                results_to_show = top5[top5["id"].isin(st.session_state.batch_scan_results)]
+                for i, (_, r) in enumerate(results_to_show.iterrows()):
+                    rid = r["id"]
+                    ai_data = st.session_state.batch_scan_results[rid]
+                    direction = ai_data.get("direction", "hold")
+                    conf = ai_data.get("confidence", 0)
+
+                    emoji_map = {"buy_yes": "🟢", "buy_no": "🔴", "hold": "🟡"}
+                    dir_label = {"buy_yes": "买 YES", "buy_no": "买 NO", "hold": "观望"}
+                    st.markdown(
+                        f"**{i+1}. {emoji_map.get(direction, '⚪')} {ai_data['question'][:60]}**"
+                    )
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.metric("方向", dir_label.get(direction, direction))
+                    with c2:
+                        st.metric("自信度", f"{'⭐' * conf}" if conf else "—")
+                    with c3:
+                        st.metric("YES", f"${ai_data['yes']:.4f}")
+                    with c4:
+                        st.metric("EV", f"{ai_data['ev_score']}分")
+
+                    # 搜索状态
+                    si = ai_data.get("search_info", {})
+                    depth = si.get("search_depth", 0)
+                    if si.get("skipped"):
+                        st.caption(f"🔍 搜索: 跳过（{si.get('skip_reason', '')}）| 纯 LLM 分析")
+                    else:
+                        st.caption(f"🔍 搜索: {'⭐' * depth} | {si.get('market_type', '')} | RAG 增强")
+
+                    with st.expander("📊 查看完整分析"):
+                        st.info(ai_data.get("text", ""))
+                        st.caption(f"NO ${ai_data['no']:.4f} | 量 ${ai_data['volume']:,.0f} | {ai_data['end_date']}")
+                        st.code(ai_data["url"], language=None)
                     st.divider()
         else:
             st.info("暂无足够数据用于 AI 分析。")
@@ -1153,12 +1520,13 @@ else:
 
             with ctrl2:
                 if st.button("🔍 单次扫描", use_container_width=True):
-                    with st.spinner("扫描中..."):
+                    with st.status("🔍 扫描中...", expanded=True) as scan_status:
                         result = subprocess.run(
                             [sys.executable, "auto_trader.py", "--once", "--dry-run"],
                             cwd=str(BASE_DIR), capture_output=True, text=True, timeout=120
                         )
                         st.text(result.stdout[-500:] if result.stdout else "(无输出)")
+                        scan_status.update(label="✅ 扫描完成", state="complete")
                         st.rerun()
 
             with ctrl3:

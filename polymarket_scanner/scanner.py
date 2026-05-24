@@ -183,6 +183,101 @@ def calc_volume_rank(market: dict) -> float:
 
 
 # ============================================================
+# 信息优势评分 (Info Edge Score)
+# 衡量"这个市场是否有可被 AI 分析利用的信息差"
+# 纯本地计算，不依赖外部 API
+# ============================================================
+def info_edge_score(
+    yes: float,
+    volume: float,
+    hours_remaining: float | None,
+    spread: float,
+    tags: list,
+) -> dict:
+    """
+    信息优势评分 — 预测市场是否存在可利用的信息不对称
+
+    评分维度：
+    1. 价格博弈区间 — uncertainty = information matters
+    2. 催化剂临近度 — near event = news coverage peaks
+    3. 成交量信号 — high vol = many participants with info
+    4. 话题可搜索性 — tags indicate news availability
+    5. 价差质量 — tight spread = efficient to trade
+
+    Returns:
+        {"score": int, "flags": list, "rating": str}
+    """
+    score = 0
+    flags = []
+
+    # ── 因子1: 价格博弈区间 (0-3) ──
+    # 45-55¢ = 最大不确定性 = 信息最有价值
+    if 0.45 <= yes <= 0.55:
+        score += 3
+        flags.append("核心博弈区间(45-55%)")
+    elif 0.35 <= yes <= 0.65:
+        score += 2
+        flags.append("博弈区间(35-65%)")
+    elif 0.25 <= yes <= 0.75:
+        score += 1
+        flags.append("可交易区间")
+
+    # ── 因子2: 催化剂临近度 (0-3) ──
+    if hours_remaining is not None:
+        if hours_remaining <= 6:
+            score += 3
+            flags.append("即将揭晓(<6h)")
+        elif hours_remaining <= 24:
+            score += 2
+            flags.append("今日揭晓(<24h)")
+        elif hours_remaining <= 72:
+            score += 1
+            flags.append("近期事件(<3天)")
+
+    # ── 因子3: 成交量信号 (0-2) ──
+    if volume > 200000:
+        score += 2
+        flags.append("高关注(>$200K)")
+    elif volume > 50000:
+        score += 1
+        flags.append("有交易量(>$50K)")
+
+    # ── 因子4: 话题可搜索性 (0-2) ──
+    # 这些话题在 DuckDuckGo 上容易搜到相关新闻
+    tag_str = " ".join(tags).lower()
+    high_info_keywords = [
+        "politics", "sports", "crypto", "election", "economy", "fed",
+        "trump", "nba", "nfl", "bitcoin", "ethereum", "sec", "rate",
+        "war", "trade", "tariff", "gdp", "inflation", "oil", "gold",
+        "政治", "经济", "选举", "体育", "加密", "战争", "贸易",
+    ]
+    match_count = sum(1 for kw in high_info_keywords if kw in tag_str)
+    if match_count >= 2:
+        score += 2
+        flags.append("高信息密度话题")
+    elif match_count >= 1:
+        score += 1
+        flags.append("可搜索话题")
+
+    # ── 因子5: 价差质量 (0-1) ──
+    if spread < 0.02:
+        score += 1
+        flags.append("低摩擦可交易")
+
+    # ── 评级 ──
+    if score >= 8:
+        rating = "🟢 高信息优势"
+    elif score >= 5:
+        rating = "🟡 有信息机会"
+    elif score >= 3:
+        rating = "🟠 信息有限"
+    else:
+        rating = "⚪ 信息不足"
+
+    return {"score": score, "flags": flags, "rating": rating}
+
+
+# ============================================================
 # EV 检测引擎 (v2 — 多因子评分)
 # ============================================================
 def ev_signal(market: dict, prices: dict) -> dict:

@@ -7,6 +7,13 @@ v2.1: RAG 增强 — 分层搜索策略 + 市场分类 + 定向新闻检索
 import os
 import re
 
+# 自动加载 .env（适配 Streamlit Cloud secrets 优先）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ============================================================
 # DeepSeek 客户端
 # ============================================================
@@ -98,7 +105,7 @@ def classify_market(question: str, tags: str = "") -> str:
 # ============================================================
 
 
-def should_search(ev_score: int, yes_price: float, volume: float) -> tuple:
+def should_search(ev_score: int, yes_price: float, volume: float, ie_score: int = 0) -> tuple:
     """判断是否需要搜索，以及搜索深度。
 
     Returns:
@@ -108,6 +115,14 @@ def should_search(ev_score: int, yes_price: float, volume: float) -> tuple:
     # 价格极端 → 市场已有结论，搜索无意义
     if yes_price < 0.05 or yes_price > 0.95:
         return 0, "价格极端（<5% 或 >95%），市场已有结论"
+
+    # 信息优势高 → 必须搜，这是找信息差的核心
+    if ie_score >= 7:
+        return 2, ""
+    if ie_score >= 5:
+        # IE 够高但 EV 中等 → 至少快速搜
+        return 2 if ev_score >= 7 else 1, ""
+
     # 低 EV + 低成交量 → 不值得
     if ev_score < 5 and volume < 50000:
         return 0, "EV 低且成交量低，不值得搜索"
@@ -193,9 +208,12 @@ def search_news(query: str, max_results: int = 5, timeout: int = 8) -> list:
     不用 API Key，免费。云端和本地均可用。
     """
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
-        return [("", "⚠️ 需安装 duckduckgo_search 库: pip install duckduckgo_search", "")]
+        try:
+            from duckduckgo_search import DDGS  # 旧版兼容
+        except ImportError:
+            return [("", "⚠️ 需安装 ddgs 库: pip install ddgs", "")]
 
     try:
         with DDGS() as ddgs:
@@ -219,21 +237,463 @@ def search_news(query: str, max_results: int = 5, timeout: int = 8) -> list:
     return output[:max_results]
 
 
-def gather_context(question: str, tags: str, ev_score: int, yes_price: float, volume: float) -> dict:
-    """一站式 RAG 上下文收集。
+# ============================================================
+# 全文抓取 — 从 URL 提取正文（替代 snippet-only）
+# ============================================================
+
+# 常见反爬 UA
+_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+}
+
+# 需要移除的标签/属性（脚本、样式、导航等非正文内容）
+_REMOVE_TAGS = ["script", "style", "nav", "footer", "header", "aside",
+                "noscript", "iframe", "form", "button", "input", "select"]
+
+# 弃用标记：部分网站用 JS 动态渲染，纯 HTTP GET 拿不到正文
+_SKIP_DOMAINS = {
+    "twitter.com", "x.com", "instagram.com", "facebook.com",
+    "reddit.com",  # Reddit 返回 JSON 而非可读正文
+}
+
+
+def fetch_article(url: str, max_chars: int = 2000, timeout: int = 10) -> str:
+    """从 URL 抓取全文正文。
+
+    策略：
+    1. HTTP GET → 检测 Content-Type（跳过非 HTML）
+    2. BeautifulSoup 解析 → 移除 script/style/nav 等噪音标签
+    3. 提取 <article> / <main> / <body> 中的可见文本
+    4. 清洗空白 → 截取前 max_chars 字符
+
+    Args:
+        url: 文章 URL
+        max_chars: 最大返回字符数
+        timeout: HTTP 超时秒数
+
+    Returns:
+        正文文本字符串；失败时返回空字符串
+    """
+    import httpx
+
+    # 跳过明确不可抓的域名
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc.lower()
+    domain = domain.removeprefix("www.")
+    if any(blocked in domain for blocked in _SKIP_DOMAINS):
+        return ""
+
+    try:
+        r = httpx.get(url, headers=_FETCH_HEADERS, timeout=timeout, follow_redirects=True)
+    except Exception:
+        return ""
+
+    if r.status_code != 200:
+        return ""
+
+    ct = r.headers.get("content-type", "")
+    if "html" not in ct and "text" not in ct:
+        # 不是 HTML/文本 — 跳过（PDF、图片等）
+        return ""
+
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return ""
+
+    # —— HTML → 正文 ——
+    soup = BeautifulSoup(r.text, "lxml")
+
+    # 移除噪音标签
+    for tag in _REMOVE_TAGS:
+        for el in soup.find_all(tag):
+            el.decompose()
+
+    # 移除 hidden 元素
+    for el in soup.find_all(attrs={"hidden": True}):
+        el.decompose()
+    for el in soup.find_all(style=re.compile(r"display\s*:\s*none")):
+        el.decompose()
+
+    # 优先取 <article> 或 <main>，否则取 <body>
+    main = soup.find("article") or soup.find("main") or soup.find("body")
+    if main is None:
+        return ""
+
+    text = main.get_text(separator="\n")
+
+    # 清洗：压缩连续空行 → 截断
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    lines = [l.strip() for l in text.split("\n")]
+    lines = [l for l in lines if l]  # 去空行
+
+    cleaned = "\n".join(lines)
+    if len(cleaned) > max_chars:
+        # 尽量在句号处截断
+        cut = cleaned.rfind("。", 0, max_chars)
+        if cut == -1:
+            cut = cleaned.rfind(". ", 0, max_chars)
+        if cut > max_chars * 0.5:
+            cleaned = cleaned[:cut + 1] + "\n...[截断]"
+        else:
+            cleaned = cleaned[:max_chars] + "\n...[截断]"
+
+    return cleaned
+
+
+def _ddg_search_with_fallback(queries: list, question: str) -> list:
+    """DDG 搜索 + 2 级降级重试，返回 [(title, snippet, url), ...]"""
+
+    _STOP = {"will", "the", "a", "an", "is", "be", "to", "of", "in", "on", "at",
+             "for", "with", "by", "from", "or", "and", "not", "no", "but", "if",
+             "has", "have", "was", "were", "are", "can", "could", "would", "should",
+             "this", "that", "these", "those", "it", "its", "his", "her", "their"}
+
+    all_results = []
+    for q in queries:
+        results = search_news(q, max_results=5)
+        for title, body, url in results:
+            if title and body and not title.startswith("⚠️"):
+                all_results.append((title, body, url))
+
+    if not all_results:
+        # 降级1: 核心实体
+        core = " ".join([w for w in question.split() if w.lower() not in _STOP][:5])
+        results = search_news(f"{core} latest news", max_results=5)
+        for title, body, url in results:
+            if title and body and not title.startswith("⚠️"):
+                all_results.append((title, body, url))
+
+    if not all_results:
+        # 降级2: question 前半段
+        short_q = " ".join(question.split()[:8])
+        results = search_news(short_q, max_results=5)
+        for title, body, url in results:
+            if title and body and not title.startswith("⚠️"):
+                all_results.append((title, body, url))
+
+    return all_results
+
+
+# ============================================================
+# Layer 2: Twitter/X 实时情绪搜索
+# ============================================================
+
+# 触发 Twitter 搜索的阈值
+_TWITTER_MIN_IE_SCORE = 7   # ie_score ≥ 7 才加 Twitter
+_TWITTER_MIN_EV_SCORE = 8   # 或者 ev_score ≥ 8
+
+# 成本控制
+_TWITTER_MAX_TWEETS = 5       # 每个市场最多搜 5 条推文
+_TWITTER_SEARCH_DAYS = 7      # 搜最近 7 天
+
+
+def _build_twitter_query(question: str, market_type: str) -> str:
+    """从市场问题提取 Twitter 搜索关键词。
+
+    策略：提取 3-5 个核心词，用 Twitter 高级搜索语法组合。
+    """
+    _STOP = {"will", "the", "a", "an", "is", "be", "to", "of", "in", "on", "at",
+             "for", "with", "by", "from", "or", "and", "not", "no", "but", "if",
+             "has", "have", "was", "were", "are", "can", "could", "would", "should",
+             "this", "that", "these", "those", "it", "its", "his", "her", "their",
+             "what", "which", "who", "whom", "how", "when", "where", "do", "does",
+             "did", "more", "than", "any", "all", "some", "every", "each", "just"}
+
+    words = question.split()
+    core = [w for w in words if w.lower() not in _STOP][:5]
+
+    if not core:
+        core = words[:4]
+
+    # 给重要词加引号确保精确匹配
+    quoted = " ".join(f'"{w}"' for w in core)
+    return quoted
+
+
+def search_twitter(question: str, market_type: str, max_tweets: int = _TWITTER_MAX_TWEETS) -> dict:
+    """搜索 Twitter/X 获取实时情绪数据。
+
+    使用 twitterapi.io Advanced Search API。
+
+    Args:
+        question: 市场问题文本
+        market_type: 市场类型（sports/politics/crypto/finance 等）
+        max_tweets: 最大推文数
 
     Returns:
         {
-            "context_text": str,      # 格式化的搜索上下文，可直接喂给 LLM
+            "tweets": [{"text": str, "likes": int, "retweets": int, "author": str, "url": str}, ...],
+            "error": str | None,     # None = 成功
+            "query": str,            # 实际使用的搜索词
+        }
+    """
+    import httpx
+
+    api_key = os.getenv("TWITTER_API_KEY", "")
+    if not api_key:
+        return {"tweets": [], "error": "未配置 TWITTER_API_KEY", "query": ""}
+
+    # 构建搜索词
+    raw_query = _build_twitter_query(question, market_type)
+
+    # 添加时间范围（Unix 时间戳）
+    now_ts = int(__import__("time").time())
+    since_ts = now_ts - _TWITTER_SEARCH_DAYS * 86400
+    query = f"{raw_query} since_time:{since_ts} until_time:{now_ts}"
+    # 注意：since_time/until_time 可能不被完全支持，先放 query 里试试
+
+    try:
+        r = httpx.get(
+            "https://api.twitterapi.io/twitter/tweet/advanced_search",
+            params={
+                "query": raw_query,       # query 放 params，不手工拼接时间
+                "queryType": "Latest",
+                "cursor": "",
+            },
+            headers={
+                "X-API-Key": api_key,
+                "Accept": "application/json",
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        return {"tweets": [], "error": f"请求失败: {e}", "query": raw_query}
+
+    if r.status_code != 200:
+        return {"tweets": [], "error": f"HTTP {r.status_code}: {r.text[:200]}", "query": raw_query}
+
+    try:
+        data = r.json()
+    except Exception:
+        return {"tweets": [], "error": "JSON 解析失败", "query": raw_query}
+
+    tweets_raw = data.get("tweets", [])
+    if not tweets_raw:
+        return {"tweets": [], "error": None, "query": raw_query}  # 无结果是正常的
+
+    tweets = []
+    for t in tweets_raw[:max_tweets]:
+        # 跳过转推（用 retweeted_tweet 字段判断）
+        if t.get("retweeted_tweet"):
+            # 如果是转推，用原文内容
+            rt = t["retweeted_tweet"]
+            text = rt.get("text", "")
+            author = rt.get("author", {}).get("userName", "unknown")
+        else:
+            text = t.get("text", "")
+            author = t.get("author", {}).get("userName", "unknown")
+
+        tweets.append({
+            "text": text,
+            "likes": t.get("likeCount", 0),
+            "retweets": t.get("retweetCount", 0),
+            "author": author,
+            "url": t.get("url", ""),
+        })
+
+    return {"tweets": tweets, "error": None, "query": raw_query}
+
+
+# ============================================================
+# Layer 3: 专题增强 — 按市场类型注入结构化数据
+# ============================================================
+
+# CoinGecko 免费 API（无需 Key，速率限制 30 req/min）
+_COINGECKO_API = "https://api.coingecko.com/api/v3"
+
+# 缓存简单的价格数据（全局 dict，避免重复请求）
+_crypto_cache: dict = {}
+_crypto_cache_ts: float = 0.0
+_CACHE_TTL = 300  # 5 分钟缓存
+
+# Oddpool 跨平台赔率（免费层：1K req/month，需注册 https://oddpool.com）
+_ODDPOOL_API = "https://api.oddpool.com"
+
+# Layer 3 触发条件（比 Layer 2 更严格，控制 API 用量）
+_L3_MIN_IE_SCORE = 8  # ie_score ≥ 8 才启用专题增强
+_L3_MIN_EV_SCORE = 8  # 或者 ev_score ≥ 8
+
+
+def _get_crypto_prices() -> dict:
+    """获取 BTC/ETH 实时价格（CoinGecko 免费 API，带缓存）。
+
+    Returns:
+        {"btc": {"usd": float, "change_24h": float}, "eth": {...}, "error": str|None}
+    """
+    import time as _time
+    import httpx
+    global _crypto_cache, _crypto_cache_ts
+
+    now = _time.time()
+    if _crypto_cache and (now - _crypto_cache_ts) < _CACHE_TTL:
+        return _crypto_cache
+
+    try:
+        r = httpx.get(
+            f"{_COINGECKO_API}/simple/price",
+            params={
+                "ids": "bitcoin,ethereum",
+                "vs_currencies": "usd",
+                "include_24hr_change": "true",
+            },
+            timeout=8,
+        )
+    except Exception as e:
+        return {"btc": {}, "eth": {}, "error": f"CoinGecko 请求失败: {e}"}
+
+    if r.status_code != 200:
+        return {"btc": {}, "eth": {}, "error": f"CoinGecko HTTP {r.status_code}"}
+
+    try:
+        data = r.json()
+    except Exception:
+        return {"btc": {}, "eth": {}, "error": "CoinGecko JSON 解析失败"}
+
+    result = {
+        "btc": {
+            "usd": data.get("bitcoin", {}).get("usd"),
+            "change_24h": data.get("bitcoin", {}).get("usd_24h_change"),
+        },
+        "eth": {
+            "usd": data.get("ethereum", {}).get("usd"),
+            "change_24h": data.get("ethereum", {}).get("usd_24h_change"),
+        },
+        "error": None,
+    }
+    _crypto_cache = result
+    _crypto_cache_ts = now
+    return result
+
+
+def search_cross_platform(question: str) -> dict:
+    """搜索 Kalshi/PredictIt 同主题市场（Oddpool API）。
+
+    需要 OODPOOL_API_KEY 环境变量。免费注册: https://oddpool.com
+
+    Returns:
+        {
+            "matches": [{"title": str, "exchange": str, "price": float, "volume": float}, ...],
+            "error": str | None,
+        }
+    """
+    api_key = os.getenv("ODDPOOL_API_KEY", "")
+    if not api_key:
+        return {"matches": [], "error": "未配置 OODPOOL_API_KEY（免费注册 https://oddpool.com）"}
+
+    import httpx
+
+    # 提取核心关键词（前 5 个有效词）
+    words = [w for w in question.split() if len(w) > 2][:5]
+    search_q = " ".join(words)
+
+    try:
+        r = httpx.get(
+            f"{_ODDPOOL_API}/search/events",
+            params={"q": search_q},
+            headers={"X-API-Key": api_key},
+            timeout=10,
+        )
+    except Exception as e:
+        return {"matches": [], "error": f"Oddpool 请求失败: {e}"}
+
+    if r.status_code == 401 or r.status_code == 403:
+        return {"matches": [], "error": "Oddpool API Key 无效或免费层不支持此端点"}
+    if r.status_code == 500:
+        return {"matches": [], "error": "Oddpool 服务暂时不可用（500），自动降级跳过"}
+    if r.status_code != 200:
+        return {"matches": [], "error": f"Oddpool HTTP {r.status_code}"}
+
+    try:
+        results = r.json()
+    except Exception:
+        return {"matches": [], "error": "Oddpool JSON 解析失败"}
+
+    matches = []
+    for item in results[:5]:
+        if not isinstance(item, dict):
+            continue
+        matches.append({
+            "title": item.get("title", ""),
+            "exchange": item.get("exchange", "unknown"),
+            "price": item.get("last_price") or item.get("yes_ask") or 0,
+            "volume": item.get("total_volume") or item.get("volume", 0),
+        })
+
+    return {"matches": matches, "error": None}
+
+
+def get_special_context(question: str, market_type: str, tags: str = "") -> str:
+    """按市场类型选择专题增强数据源（Layer 3）。
+
+    Returns:
+        格式化的增强上下文字符串；无增强时返回空字符串
+    """
+    parts = []
+
+    # —— 加密市场 → CoinGecko 实时价格 ——
+    if market_type in ("crypto", "crypto_finance"):
+        crypto = _get_crypto_prices()
+        if not crypto.get("error"):
+            btc = crypto.get("btc", {})
+            eth = crypto.get("eth", {})
+            parts.append("【Layer 3: 加密市场实时数据】")
+            if btc.get("usd"):
+                chg = btc.get("change_24h", 0) or 0
+                arrow = "📈" if chg > 0 else ("📉" if chg < 0 else "➡️")
+                parts.append(f"BTC: ${btc['usd']:,.0f} (24h {chg:+.2f}%) {arrow}")
+            if eth.get("usd"):
+                chg = eth.get("change_24h", 0) or 0
+                arrow = "📈" if chg > 0 else ("📉" if chg < 0 else "➡️")
+                parts.append(f"ETH: ${eth['usd']:,.0f} (24h {chg:+.2f}%) {arrow}")
+        elif crypto.get("error"):
+            parts.append(f"【Layer 3: 加密数据】⚠️ {crypto['error']}")
+
+    # —— 政治/经济 → 跨平台赔率对比 ——
+    if market_type in ("politics", "finance"):
+        cross = search_cross_platform(question)
+        if cross["matches"]:
+            parts.append("【Layer 3: 跨平台赔率对比 (Kalshi/PredictIt)】")
+            for m in cross["matches"]:
+                parts.append(
+                    f"- [{m['exchange']}] {m['title'][:80]}: "
+                    f"${m['price']:.4f} | Vol ${m['volume']:,.0f}"
+                )
+        elif cross["error"] and "未配置" not in cross["error"]:
+            parts.append(f"【Layer 3: 跨平台赔率】⚠️ {cross['error']}")
+
+    return "\n".join(parts) if parts else ""
+
+
+def gather_context(question: str, tags: str, ev_score: int, yes_price: float, volume: float, ie_score: int = 0) -> dict:
+    """多源 RAG 上下文收集（v2.5 — Layer 1 全文 + Layer 2 Twitter + Layer 3 专题增强）。
+
+    管线：
+    1. DDG 发现 URL → fetch_article() 抓取全文（Layer 1）
+    2. 全文获取失败的 URL → 降级为 snippet
+    3. Twitter/X 实时搜索（Layer 2，仅高价值市场）
+    4. 专题增强（Layer 3，仅极高价值市场）
+
+    Returns:
+        {
+            "context_text": str,      # 格式化的搜索上下文
             "market_type": str,
-            "search_depth": int,      # 0/1/2
-            "sources": list,          # 新闻来源列表
-            "skipped": bool,          # 是否跳过了搜索
+            "search_depth": int,
+            "sources": list,
+            "full_articles": int,     # Layer 1 全文数量
+            "twitter_tweets": int,    # Layer 2 推文数量
+            "skipped": bool,
             "skip_reason": str,
         }
     """
     market_type = classify_market(question, tags)
-    depth, skip_reason = should_search(ev_score, yes_price, volume)
+    depth, skip_reason = should_search(ev_score, yes_price, volume, ie_score=ie_score)
 
     if depth == 0:
         return {
@@ -241,40 +701,122 @@ def gather_context(question: str, tags: str, ev_score: int, yes_price: float, vo
             "market_type": market_type,
             "search_depth": 0,
             "sources": [],
+            "full_articles": 0,
+            "twitter_tweets": 0,
+            "special_enhancements": 0,
             "skipped": True,
             "skip_reason": skip_reason,
         }
 
-    # 构建搜索词并执行
+    # ——— Layer 1: DDG 发现 URL ———
     queries = build_search_queries(question, market_type)
-    max_queries = depth  # depth=1 → 搜 1 条, depth=2 → 搜 2 条
+    max_queries = depth  # depth=1 → 1 条查询, depth=2 → 2 条查询
+    ddg_results = _ddg_search_with_fallback(queries[:max_queries], question)
 
-    all_news = []
-    sources = []
-    for q in queries[:max_queries]:
-        results = search_news(q, max_results=3)
-        for title, body, url in results:
-            if title and body and not title.startswith("⚠️"):
-                all_news.append(f"- **{title}**: {body[:300]}")
-                if url:
-                    sources.append(url)
-
-    if not all_news:
+    if not ddg_results:
         return {
             "context_text": "",
             "market_type": market_type,
             "search_depth": 0,
             "sources": [],
+            "full_articles": 0,
+            "twitter_tweets": 0,
+            "special_enhancements": 0,
             "skipped": True,
-            "skip_reason": "搜索无结果",
+            "skip_reason": "搜索无结果（DDG + 2次降级均失败）",
         }
 
-    context_text = "【实时搜索上下文】\n" + "\n".join(all_news[:6])
+    # ——— Layer 2: 抓取全文 ———
+    # 前 N 个有 URL 的结果 → 尝试全文抓取
+    FULL_FETCH_COUNT = 2  # 最多抓 2 篇全文
+    context_parts = []
+    sources = []
+    full_count = 0
+
+    for title, snippet, url in ddg_results:
+        if not url:
+            # 无 URL，保留 snippet
+            context_parts.append(f"- **[DDG摘要] {title}**: {snippet[:200]}")
+            continue
+
+        sources.append(url)
+
+        # 已抓到足够的全文 → 剩下的用 snippet
+        if full_count >= FULL_FETCH_COUNT:
+            context_parts.append(f"- **[DDG摘要] {title}**: {snippet[:200]}")
+            continue
+
+        # 尝试抓全文
+        full_text = fetch_article(url, max_chars=2000)
+        if full_text and len(full_text) > 100:  # 至少 100 字符才认为有效
+            full_count += 1
+            context_parts.append(
+                f"═══════════════════════════════════\n"
+                f"【全文 #{full_count}】{title}\n"
+                f"来源: {url}\n"
+                f"───────────────────────────────────\n"
+                f"{full_text}\n"
+            )
+        else:
+            # 全文抓取失败 → 降级为 snippet
+            context_parts.append(f"- **[DDG摘要] {title}**: {snippet[:200]}")
+
+    if not context_parts:
+        return {
+            "context_text": "",
+            "market_type": market_type,
+            "search_depth": 0,
+            "sources": sources[:5],
+            "full_articles": 0,
+            "twitter_tweets": 0,
+            "special_enhancements": 0,
+            "skipped": True,
+            "skip_reason": "DDG 有结果但解析后无有效内容",
+        }
+
+    # ——— Layer 2: Twitter/X 实时情绪 ———
+    should_twitter = (ie_score >= _TWITTER_MIN_IE_SCORE or ev_score >= _TWITTER_MIN_EV_SCORE)
+    twitter_count = 0
+    if should_twitter:
+        tw_result = search_twitter(question, market_type, max_tweets=_TWITTER_MAX_TWEETS)
+        if tw_result["tweets"]:
+            twitter_count = len(tw_result["tweets"])
+            tw_lines = [
+                "",
+                "═══════════════════════════════════",
+                "【Layer 2: Twitter/X 实时情绪】",
+                f"搜索词: {tw_result['query']}",
+                f"最近 {_TWITTER_SEARCH_DAYS} 天 · {twitter_count} 条推文 · 按时间排序",
+                "───────────────────────────────────",
+            ]
+            for i, t in enumerate(tw_result["tweets"], 1):
+                engagement = f"♥{t['likes']} 🔄{t['retweets']}"
+                tw_lines.append(f"{i}. @{t['author']} ({engagement}):")
+                tw_lines.append(f"   {t['text'][:280]}")
+                tw_lines.append("")
+            context_parts.append("\n".join(tw_lines))
+
+    # ——— Layer 3: 专题增强 ———
+    should_special = (ie_score >= _L3_MIN_IE_SCORE or ev_score >= _L3_MIN_EV_SCORE)
+    special_count = 0
+    if should_special:
+        special_text = get_special_context(question, market_type, tags)
+        if special_text:
+            special_count = 1
+            context_parts.append("\n" + special_text)
+        elif (cross := search_cross_platform(question)) and cross.get("error"):
+            # 跨平台搜索有结果但无匹配 → 静默跳过
+            pass
+
+    context_text = "【多源搜索上下文（Layer 1 全文 + Layer 2 Twitter + Layer 3 专题增强）】\n\n" + "\n".join(context_parts[:14])
     return {
         "context_text": context_text,
         "market_type": market_type,
         "search_depth": depth,
         "sources": sources[:5],
+        "full_articles": full_count,
+        "twitter_tweets": twitter_count,
+        "special_enhancements": special_count,
         "skipped": False,
         "skip_reason": "",
     }
@@ -340,20 +882,117 @@ def analyze_market(
 【量化EV评分】{ev_score}/12分（{ev_summary}）
 【时间紧迫度】{urgency_label}"""
 
+    full_articles = ctx.get("full_articles", 0)
+    twitter_tweets = ctx.get("twitter_tweets", 0)
+    special_enhancements = ctx.get("special_enhancements", 0)
+    max_tok = 600  # 默认 token 预算
+
     if context_text:
+        # 根据信息量调整分析深度
+        # 构建数据层描述
+        data_layers = []
+        if full_articles >= 2:
+            data_layers.append(f"{full_articles} 篇完整新闻文章")
+        elif full_articles == 1:
+            data_layers.append("1 篇完整文章 + 若干摘要")
+        else:
+            data_layers.append("若干新闻标题摘要")
+        if twitter_tweets > 0:
+            data_layers.append(f"{twitter_tweets} 条 Twitter/X 实时推文")
+        if special_enhancements > 0:
+            data_layers.append("Layer 3 专题增强（跨平台赔率对比 / 加密实时行情）")
+
+        data_desc = "、".join(data_layers)
+
+        # 构建分析指引
+        guide_lines = [f"你拿到了以下信息：{data_desc}。"]
+        analysis_items = []
+
+        if full_articles >= 2:
+            analysis_items.extend([
+                "交叉验证文章和推文的关键事实是否一致",
+                "区分「确定性事实」和「推测性观点」",
+                "Twitter 情绪可反映市场短期预期",
+                "如果有引用具体数据（民调、赔率、统计），优先使用",
+            ])
+            if special_enhancements > 0:
+                analysis_items.append("对比 Layer 3 跨平台赔率 vs Polymarket 定价：哪边更合理？有无套利空间？")
+            word_limit = "分析控制在 400 字以内，重点是证据质量和交叉验证"
+            max_tok = 900
+        elif full_articles == 1:
+            analysis_items.extend([
+                "用文章细节和推文观点支撑判断",
+            ])
+            if special_enhancements > 0:
+                analysis_items.append("跨平台赔率数据可作为独立定价参考，与 Polymarket 对比")
+            word_limit = "分析控制在 300 字以内"
+            max_tok = 800
+        elif twitter_tweets > 0:
+            analysis_items.append("结合社交平台情绪和新闻摘要综合判断")
+            if special_enhancements > 0:
+                analysis_items.append("跨平台赔率 / 加密行情为额外信号来源，权衡权重")
+            word_limit = "分析控制在 280 字以内"
+            max_tok = 750
+        else:
+            if special_enhancements > 0:
+                analysis_items.append("虽然无全文文章，但跨平台赔率/加密行情提供独立定价信号")
+                word_limit = "分析控制在 250 字以内"
+                max_tok = 700
+            else:
+                analysis_items.append("保守判断，标注信息不足")
+                word_limit = "分析控制在 200 字以内"
+                max_tok = 600
+
+        if analysis_items:
+            guide_lines.append("请：\n" + "\n".join(f"{i}. {item}" for i, item in enumerate(analysis_items, 1)))
+
+        info_guide = "。".join(guide_lines) + "。"
+
+        # 构建动态分析维度
+        analysis_dims = [
+            "1. **你的真实概率判断**：结合搜索证据，这件事实际发生的概率大概多少？为什么？",
+            "2. **与市场定价的偏差**：市场是高估还是低估了？证据强度如何？",
+            "3. **关键证据**：从搜索材料中引述 1-2 条最有力的证据（标注来源：文章/Twitter/Layer3）",
+        ]
+        dim_idx = 4
+        if twitter_tweets > 0:
+            analysis_dims.append(f"{dim_idx}. **Twitter 情绪**：整体偏多/偏空/中性，有无关键意见领袖表态")
+            dim_idx += 1
+        if special_enhancements > 0:
+            analysis_dims.append(f"{dim_idx}. **跨平台/专题数据**：Layer 3 数据提供了什么额外信号？与 Polymarket 定价有无偏差？")
+            dim_idx += 1
+        analysis_dims.append(f"{dim_idx}. **操作建议**：买YES / 买NO / 观望，简要理由")
+        dim_idx += 1
+
+        # 信息质量描述
+        iq_parts = []
+        if full_articles > 0:
+            iq_parts.append(f"全文{full_articles}篇")
+        if twitter_tweets > 0:
+            iq_parts.append(f"Twitter{twitter_tweets}条")
+        if special_enhancements > 0:
+            iq_parts.append("Layer3专题增强")
+        iq_parts.append("摘要若干")
+        iq_desc = " + ".join(iq_parts)
+
+        analysis_dims.append(f"{dim_idx}. **信息质量**：足/一般/不足（{iq_desc}）")
+        dim_idx += 1
+        analysis_dims.append(f"{dim_idx}. **一句话风险提示**")
+        dim_idx += 1
+        analysis_dims.append(f"{dim_idx}. **自信度**（1-5星，5=非常确定；信息不足时应偏低）")
+
+        analysis_dim_text = "\n".join(analysis_dims)
+
         prompt = f"""你是预测市场分析专家。请结合以下**实时搜索信息**分析这个 Polymarket 市场：
 
 {base_info}
 
 {context_text}
 
-请用简洁中文给出（200字内）：
-1. **你的真实概率判断**：结合搜索结果，这件事实际发生的概率大概多少？为什么？
-2. **与市场定价的偏差**：市场是高估还是低估了？
-3. **操作建议**：买YES / 买NO / 观望，简要理由
-4. **信息可信度**：搜索结果是否有足够信息支撑判断？（足/一般/不足）
-5. **一句话风险提示**
-6. **自信度**（1-5星，5=非常确定）
+{info_guide}
+
+请用简洁中文给出（{word_limit}）：
+{analysis_dim_text}
 
 最后，在最后一行用严格格式输出结构化结论（必须包含）：
 DIRECTION: buy_yes / buy_no / hold
@@ -384,7 +1023,7 @@ SUMMARY: 一句话总结"""
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=600,
+            max_tokens=max_tok,
         )
         raw = response.choices[0].message.content
 
@@ -429,12 +1068,16 @@ SUMMARY: 一句话总结"""
 
 
 # ============================================================
-# 快速扫描（不变）
+# 快速扫描（已废弃 — 请用 analyze_market()）
 # ============================================================
 
 
 def quick_scan(question: str, yes_price: float, end_date: str) -> str:
-    """快速扫一眼市场，只给一句话判断。"""
+    """[已废弃] 快速扫一眼市场，只给一句话判断。
+    
+    此函数缺乏 RAG 实时搜索和结构化输出，与 analyze_market() 结果矛盾。
+    v2.2 起不再使用，保留仅为向后兼容。
+    """
     client, error = get_deepseek_client()
     if error:
         return error
