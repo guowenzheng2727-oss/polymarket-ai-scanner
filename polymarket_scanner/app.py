@@ -29,6 +29,130 @@ from ai_analyzer import analyze_market, gather_context
 
 
 # ============================================================
+# 可复用组件：组合仓位计算器
+# ============================================================
+def render_hedge_calculator(yes_price: float, no_price: float, key_prefix: str = ""):
+    """渲染双向持仓策略计算器，可在新手/专业模式复用。
+
+    Args:
+        yes_price: YES 价格
+        no_price: NO 价格
+        key_prefix: Streamlit widget key 前缀，防止重复
+    """
+    total_cost = yes_price + no_price
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("YES 价格", f"${yes_price:.4f}")
+    with c2:
+        st.metric("NO 价格", f"${no_price:.4f}")
+    with c3:
+        st.metric("双向成本", f"${total_cost:.4f}", delta="套利!" if total_cost < 1.0 else None)
+
+    if total_cost < 1.0:
+        st.success(f"🎯 **套利机会！** YES+NO=${total_cost:.4f} < $1.00，无风险套利空间 ${1-total_cost:.4f}（{(1-total_cost)/total_cost*100:.1f}%）")
+    elif total_cost > 1.02:
+        st.warning(f"⚠️ 双向成本 ${total_cost:.4f} 偏高，需精准判断方向才能盈利")
+    else:
+        st.info(f"💡 双向成本 ${total_cost:.4f}，接近平价")
+
+    budget = st.number_input(
+        "💰 你的总预算 ($)", min_value=1.0, max_value=1000.0, value=10.0, step=1.0,
+        key=f"{key_prefix}_hedge_budget"
+    )
+
+    st.markdown("#### 📐 策略模拟")
+
+    # 策略1: 等金额对冲
+    yes_amount_1 = budget / 2
+    no_amount_1 = budget / 2
+    yes_shares_1 = yes_amount_1 / yes_price if yes_price > 0 else 0
+    no_shares_1 = no_amount_1 / no_price if no_price > 0 else 0
+    profit_if_yes_1 = yes_shares_1 * (1 - yes_price) - no_amount_1
+    profit_if_no_1 = no_shares_1 * (1 - no_price) - yes_amount_1
+
+    # 策略2: 收益平衡配比
+    if yes_price > 0 and no_price > 0:
+        denom = (1/yes_price) + 1 + (1/no_price)
+        if denom > 0:
+            x_opt = budget * (1 + 1/no_price) / denom
+            x_opt = max(0, min(budget, x_opt))
+        else:
+            x_opt = budget / 2
+    else:
+        x_opt = budget / 2
+
+    yes_amount_2 = x_opt
+    no_amount_2 = budget - x_opt
+    yes_shares_2 = yes_amount_2 / yes_price if yes_price > 0 else 0
+    no_shares_2 = no_amount_2 / no_price if no_price > 0 else 0
+    profit_if_yes_2 = yes_shares_2 * (1 - yes_price) - no_amount_2
+    profit_if_no_2 = no_shares_2 * (1 - no_price) - yes_amount_2
+
+    # 策略3: 方向加重注
+    your_direction = st.radio(
+        "你的判断方向（加重注）", ["均衡", "偏 YES", "偏 NO"],
+        horizontal=True, key=f"{key_prefix}_hedge_dir"
+    )
+    if your_direction == "偏 YES":
+        yes_amount_3 = budget * 0.7
+        no_amount_3 = budget * 0.3
+    elif your_direction == "偏 NO":
+        yes_amount_3 = budget * 0.3
+        no_amount_3 = budget * 0.7
+    else:
+        yes_amount_3 = budget * 0.5
+        no_amount_3 = budget * 0.5
+
+    yes_shares_3 = yes_amount_3 / yes_price if yes_price > 0 else 0
+    no_shares_3 = no_amount_3 / no_price if no_price > 0 else 0
+    profit_if_yes_3 = yes_shares_3 * (1 - yes_price) - no_amount_3
+    profit_if_no_3 = no_shares_3 * (1 - no_price) - yes_amount_3
+
+    # 展示表格
+    def fmt_profit(p):
+        emoji = "🟢" if p > 0 else ("🔴" if p < 0 else "⚪")
+        return f"{emoji} ${p:+.2f}"
+
+    hedge_df = pd.DataFrame({
+        "策略": ["等金额对冲", "收益平衡", your_direction],
+        "YES 仓位": [f"${yes_amount_1:.2f}", f"${yes_amount_2:.2f}", f"${yes_amount_3:.2f}"],
+        "NO 仓位": [f"${no_amount_1:.2f}", f"${no_amount_2:.2f}", f"${no_amount_3:.2f}"],
+        "若 YES 赢": [fmt_profit(profit_if_yes_1), fmt_profit(profit_if_yes_2), fmt_profit(profit_if_yes_3)],
+        "若 NO 赢": [fmt_profit(profit_if_no_1), fmt_profit(profit_if_no_2), fmt_profit(profit_if_no_3)],
+        "最差情况": [
+            fmt_profit(min(profit_if_yes_1, profit_if_no_1)),
+            fmt_profit(min(profit_if_yes_2, profit_if_no_2)),
+            fmt_profit(min(profit_if_yes_3, profit_if_no_3)),
+        ],
+    })
+    st.table(hedge_df)
+
+    # 推荐策略
+    best_strategy = None
+    best_min_profit = -9999
+    strategies = [
+        ("等金额对冲", profit_if_yes_1, profit_if_no_1),
+        ("收益平衡", profit_if_yes_2, profit_if_no_2),
+        (your_direction, profit_if_yes_3, profit_if_no_3),
+    ]
+    for name, py, pn in strategies:
+        min_p = min(py, pn)
+        if min_p > best_min_profit:
+            best_min_profit = min_p
+            best_strategy = name
+
+    if best_min_profit > 0:
+        st.success(f"🎯 **推荐策略：{best_strategy}** — 无论结果如何都盈利！最差盈利 ${best_min_profit:.2f}")
+    elif best_min_profit > -budget * 0.1:
+        st.info(f"💡 **推荐策略：{best_strategy}** — 风险可控，最差亏损 ${abs(best_min_profit):.2f}（{abs(best_min_profit)/budget*100:.1f}%）")
+    else:
+        st.warning(f"⚠️ **{best_strategy}** 相对最优，但双向成本高，建议精准判断单一方向")
+
+    st.caption("💡 提示：Polymarket 对赢家收取 2% 手续费，实际收益略低于上述计算")
+
+
+# ============================================================
 # 页面配置
 # ============================================================
 st.set_page_config(
@@ -539,11 +663,14 @@ if mode == "beginner":
             st.session_state.batch_ai_pending = True
             st.rerun()
     with ctl2:
-        analyzed_count = len([
-            rid for _, row in recommend.iterrows()
-            if row["id"] in st.session_state.ai_results
-        ])
-        st.caption(f"已分析: {analyzed_count}/{len(recommend)}")
+        if not recommend.empty:
+            analyzed_count = len([
+                rid for _, row in recommend.iterrows()
+                if row["id"] in st.session_state.ai_results
+            ])
+            st.caption(f"已分析: {analyzed_count}/{len(recommend)}")
+        else:
+            st.caption("已分析: 0/0")
     with ctl3:
         if st.session_state.ai_results:
             show_only = st.toggle(
@@ -659,6 +786,14 @@ if mode == "beginner":
                         )
                         st.code(ai_data["url"], language=None)
                         st.caption("⬆️ 复制链接 → 浏览器打开 → MetaMask 下单")
+
+                # ── 组合仓位计算器（新手模式也加上） ──
+                with st.expander("🧮 组合仓位计算器（双向持仓策略）", expanded=False):
+                    render_hedge_calculator(
+                        yes_price=float(row['yes']),
+                        no_price=float(row['no']),
+                        key_prefix=f"nov_{rid[:8]}"
+                    )
 
                 st.divider()
 
@@ -961,125 +1096,11 @@ else:
 
                 # ── 组合仓位计算器（对冲/套利） ──
                 st.markdown("---")
-                st.markdown("### 🧮 组合仓位计算器（双向持仓策略）")
-                st.caption("同时买 YES + NO，寻找『猜错不亏、猜中大赚』的仓位配比")
-
-                yes_price = float(row['yes'])
-                no_price = float(row['no'])
-                total_cost = yes_price + no_price
-
-                # 基础信息
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.metric("YES 价格", f"${yes_price:.4f}")
-                with c2:
-                    st.metric("NO 价格", f"${no_price:.4f}")
-                with c3:
-                    st.metric("双向成本", f"${total_cost:.4f}", delta="套利!" if total_cost < 1.0 else None)
-
-                if total_cost < 1.0:
-                    st.success(f"🎯 **套利机会！** YES+NO=${total_cost:.4f} < $1.00，无风险套利空间 ${1-total_cost:.4f}（{(1-total_cost)/total_cost*100:.1f}%）")
-                elif total_cost > 1.02:
-                    st.warning(f"⚠️ 双向成本 ${total_cost:.4f} 偏高，需精准判断方向才能盈利")
-                else:
-                    st.info(f"💡 双向成本 ${total_cost:.4f}，接近平价")
-
-                # 用户输入预算
-                budget = st.number_input("💰 你的总预算 ($)", min_value=1.0, max_value=1000.0, value=10.0, step=1.0, key="hedge_budget")
-
-                # 计算最优配比
-                st.markdown("#### 📐 策略模拟")
-
-                # 策略1: 等金额对冲（最保守）
-                yes_amount_1 = budget / 2
-                no_amount_1 = budget / 2
-                yes_shares_1 = yes_amount_1 / yes_price if yes_price > 0 else 0
-                no_shares_1 = no_amount_1 / no_price if no_price > 0 else 0
-                profit_if_yes_1 = yes_shares_1 * (1 - yes_price) - no_amount_1  # YES赢时：YES盈利 - NO亏损
-                profit_if_no_1 = no_shares_1 * (1 - no_price) - yes_amount_1   # NO赢时：NO盈利 - YES亏损
-
-                # 策略2: 按价格反比配比（让两边潜在收益相等）
-                # 设 YES 投 x, NO 投 (budget-x)
-                # YES赢收益 = x/yes_price * (1-yes_price) - (budget-x) = x*(1-yes_price)/yes_price - budget + x
-                # NO赢收益 = (budget-x)/no_price * (1-no_price) - x = (budget-x)*(1-no_price)/no_price - x
-                # 令两边相等解 x
-                if yes_price > 0 and no_price > 0:
-                    # YES_win_profit = x * (1-yes_price)/yes_price - (budget-x)
-                    #                = x * (1/yes_price - 1) - budget + x
-                    #                = x / yes_price - budget
-                    # NO_win_profit = (budget-x) * (1-no_price)/no_price - x
-                    #               = (budget-x) / no_price - x
-                    # 令相等: x/yes_price - budget = (budget-x)/no_price - x
-                    # x/yes_price + x = budget + (budget-x)/no_price
-                    # x * (1/yes_price + 1) = budget + budget/no_price - x/no_price
-                    # x * (1/yes_price + 1 + 1/no_price) = budget * (1 + 1/no_price)
-                    denom = (1/yes_price) + 1 + (1/no_price)
-                    if denom > 0:
-                        x_opt = budget * (1 + 1/no_price) / denom
-                        x_opt = max(0, min(budget, x_opt))
-                    else:
-                        x_opt = budget / 2
-                else:
-                    x_opt = budget / 2
-
-                yes_amount_2 = x_opt
-                no_amount_2 = budget - x_opt
-                yes_shares_2 = yes_amount_2 / yes_price if yes_price > 0 else 0
-                no_shares_2 = no_amount_2 / no_price if no_price > 0 else 0
-                profit_if_yes_2 = yes_shares_2 * (1 - yes_price) - no_amount_2
-                profit_if_no_2 = no_shares_2 * (1 - no_price) - yes_amount_2
-
-                # 策略3: 你判断方向，加重注
-                your_direction = st.radio("你的判断方向（加重注）", ["均衡", "偏 YES", "偏 NO"], horizontal=True, key="hedge_dir")
-                if your_direction == "偏 YES":
-                    yes_amount_3 = budget * 0.7
-                    no_amount_3 = budget * 0.3
-                elif your_direction == "偏 NO":
-                    yes_amount_3 = budget * 0.3
-                    no_amount_3 = budget * 0.7
-                else:
-                    yes_amount_3 = budget * 0.5
-                    no_amount_3 = budget * 0.5
-
-                yes_shares_3 = yes_amount_3 / yes_price if yes_price > 0 else 0
-                no_shares_3 = no_amount_3 / no_price if no_price > 0 else 0
-                profit_if_yes_3 = yes_shares_3 * (1 - yes_price) - no_amount_3
-                profit_if_no_3 = no_shares_3 * (1 - no_price) - yes_amount_3
-
-                # 展示三种策略对比
-                st.markdown("| 策略 | YES 仓位 | NO 仓位 | 若YES赢 | 若NO赢 | 最差情况 |")
-                st.markdown("|------|----------|---------|---------|--------|----------|")
-
-                def fmt_profit(p):
-                    emoji = "🟢" if p > 0 else ("🔴" if p < 0 else "⚪")
-                    return f"{emoji} ${p:+.2f}"
-
-                st.markdown(f"| 等金额对冲 | ${yes_amount_1:.2f} | ${no_amount_1:.2f} | {fmt_profit(profit_if_yes_1)} | {fmt_profit(profit_if_no_1)} | {fmt_profit(min(profit_if_yes_1, profit_if_no_1))} |")
-                st.markdown(f"| 收益平衡 | ${yes_amount_2:.2f} | ${no_amount_2:.2f} | {fmt_profit(profit_if_yes_2)} | {fmt_profit(profit_if_no_2)} | {fmt_profit(min(profit_if_yes_2, profit_if_no_2))} |")
-                st.markdown(f"| {your_direction} | ${yes_amount_3:.2f} | ${no_amount_3:.2f} | {fmt_profit(profit_if_yes_3)} | {fmt_profit(profit_if_no_3)} | {fmt_profit(min(profit_if_yes_3, profit_if_no_3))} |")
-
-                # 推荐策略
-                best_strategy = None
-                best_min_profit = -9999
-                strategies = [
-                    ("等金额对冲", profit_if_yes_1, profit_if_no_1),
-                    ("收益平衡", profit_if_yes_2, profit_if_no_2),
-                    (your_direction, profit_if_yes_3, profit_if_no_3),
-                ]
-                for name, py, pn in strategies:
-                    min_p = min(py, pn)
-                    if min_p > best_min_profit:
-                        best_min_profit = min_p
-                        best_strategy = name
-
-                if best_min_profit > 0:
-                    st.success(f"🎯 **推荐策略：{best_strategy}** — 无论结果如何都盈利！最差盈利 ${best_min_profit:.2f}")
-                elif best_min_profit > -budget * 0.1:
-                    st.info(f"💡 **推荐策略：{best_strategy}** — 风险可控，最差亏损 ${abs(best_min_profit):.2f}（{abs(best_min_profit)/budget*100:.1f}%）")
-                else:
-                    st.warning(f"⚠️ **{best_strategy}** 相对最优，但双向成本高，建议精准判断单一方向")
-
-                st.caption("💡 提示：Polymarket 对赢家收取 2% 手续费，实际收益略低于上述计算")
+                render_hedge_calculator(
+                    yes_price=float(row['yes']),
+                    no_price=float(row['no']),
+                    key_prefix=f"pro_{row['id'][:8]}"
+                )
         else:
             st.info("无符合筛选条件的市场。")
 
