@@ -665,7 +665,7 @@ if mode == "beginner":
     with ctl2:
         if not recommend.empty:
             analyzed_count = len([
-                rid for _, row in recommend.iterrows()
+                row["id"] for _, row in recommend.iterrows()
                 if row["id"] in st.session_state.ai_results
             ])
             st.caption(f"已分析: {analyzed_count}/{len(recommend)}")
@@ -1275,7 +1275,7 @@ else:
                 st.rerun()
         with ctl2:
             analyzed_count = len([
-                rid for _, row in recommend.iterrows()
+                row["id"] for _, row in recommend.iterrows()
                 if row["id"] in st.session_state.ai_results
             ])
             st.caption(f"已分析: {analyzed_count}/{len(recommend)}")
